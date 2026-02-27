@@ -112,6 +112,9 @@ class accountInputs(SystemStage):
     def get_raw_cost_data(self, instrument_code: str) -> instrumentCosts:
         return self.parent.rawdata.get_raw_cost_data(instrument_code)
 
+    def get_funding_rate(self, instrument_code: str) -> pd.Series:
+        return self.parent.rawdata.daily_funding_rate(instrument_code)
+
     def get_rolls_per_year(self, instrument_code: str) -> int:
         rolls_per_year = self.parent.rawdata.rolls_per_year(instrument_code)
 

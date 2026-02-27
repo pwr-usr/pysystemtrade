@@ -1,6 +1,6 @@
 import pandas as pd
 
-from syscore.exceptions import missingInstrument
+from syscore.exceptions import missingData, missingInstrument
 from sysdata.sim.sim_data import simData
 
 from sysobjects.adjusted_prices import futuresAdjustedPrices
@@ -124,10 +124,26 @@ class futuresSimData(simData):
         ]
 
     def get_rolls_per_year(self, instrument_code: str) -> int:
+        if self.is_perpetual_crypto_instrument(instrument_code):
+            return 0
         roll_parameters = self.get_roll_parameters(instrument_code)
-        rolls_per_year = roll_parameters.rolls_per_year_in_hold_cycle()
+        return roll_parameters.rolls_per_year_in_hold_cycle()
 
-        return rolls_per_year
+    def is_perpetual_crypto_instrument(self, instrument_code: str) -> bool:
+        try:
+            instrument = self.get_instrument_object_with_meta_data(instrument_code)
+            asset_class = str(getattr(instrument.meta_data, "AssetClass", "")).lower()
+        except missingData:
+            return False
+
+        if asset_class != "crypto":
+            return False
+
+        roll_parameters = self.get_roll_parameters(instrument_code)
+        return (
+            roll_parameters.hold_rollcycle.cyclestring == "Z"
+            and roll_parameters.priced_rollcycle.cyclestring == "Z"
+        )
 
     def get_raw_cost_data(self, instrument_code: str) -> instrumentCosts:
         """

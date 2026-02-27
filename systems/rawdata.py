@@ -4,9 +4,10 @@ import pandas as pd
 
 from systems.stage import SystemStage
 from syscore.objects import resolve_function
-from syscore.dateutils import ROOT_BDAYS_INYEAR
+from syscore.dateutils import ROOT_BDAYS_INYEAR, CALENDAR_DAYS_IN_YEAR
 from syscore.genutils import list_intersection
 from syscore.exceptions import missingData
+from syscore.pandas.pdutils import uniquets
 from systems.system_cache import input, diagnostic, output
 
 from sysdata.sim.futures_sim_data import futuresSimData
@@ -508,9 +509,18 @@ class RawData(SystemStage):
         """
 
         carrydata = self.get_instrument_raw_carry_data(instrument_code)
-        raw_roll = carrydata.raw_futures_roll()
+        if self._is_perpetual_crypto_instrument(instrument_code):
+            raw_roll = carrydata.price - carrydata.carry
+            raw_roll = uniquets(raw_roll)
+        else:
+            raw_roll = carrydata.raw_futures_roll()
 
         return raw_roll
+
+    def _is_perpetual_crypto_instrument(self, instrument_code: str) -> bool:
+        if not hasattr(self.data_stage, "is_perpetual_crypto_instrument"):
+            return False
+        return self.data_stage.is_perpetual_crypto_instrument(instrument_code)
 
     @diagnostic()
     def roll_differentials(self, instrument_code: str) -> pd.Series:
@@ -733,6 +743,26 @@ class RawData(SystemStage):
         )
 
         return instruments_in_asset_class_and_master_list
+
+    @diagnostic()
+    def daily_funding_rate(self, instrument_code: str) -> pd.Series:
+        if not self._is_perpetual_crypto_instrument(instrument_code):
+            return pd.Series(dtype=float)
+
+        carrydata = self.get_instrument_raw_carry_data(instrument_code)
+        price = carrydata.PRICE
+        carry = carrydata.CARRY
+
+        safe_price = price.replace(0, float("nan"))
+        # CARRY column encodes a ~1-month forward implied funding premium.
+        # The synthetic contract pair (2099-12 / 2100-01) gives a 1/12 year
+        # differential, so dividing by that (i.e. *12) annualizes the rate.
+        ann_funding_rate = (carry - safe_price) / safe_price * 12
+        daily_funding_rate = ann_funding_rate / CALENDAR_DAYS_IN_YEAR
+
+        daily_funding_rate = daily_funding_rate.resample("1D").last().ffill()
+
+        return daily_funding_rate
 
     def instrument_list(self) -> list:
         instrument_list = self.parent.get_instrument_list()

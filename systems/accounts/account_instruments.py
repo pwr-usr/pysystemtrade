@@ -1,6 +1,7 @@
 import pandas as pd
 
 from syscore.pandas.strategy_functions import turnover
+from syscore.genutils import str2Bool
 
 from systems.system_cache import diagnostic, dont_cache
 from systems.accounts.account_costs import accountCosts
@@ -202,6 +203,14 @@ class accountInstruments(accountCosts, accountBufferingSystemLevel):
         rolls_per_year = self.get_rolls_per_year(instrument_code)
         multiply_roll_costs_by = self.config.multiply_roll_costs_by
 
+        include_funding_costs = str2Bool(
+            getattr(self.config, "include_funding_costs", True)
+        )
+        if include_funding_costs:
+            funding_rate = self.get_funding_rate(instrument_code)
+        else:
+            funding_rate = pd.Series(dtype=float)
+
         pandl_calculator = pandlCalculationWithCashCostsAndFills(
             price,
             raw_costs=raw_costs,
@@ -214,6 +223,7 @@ class accountInstruments(accountCosts, accountBufferingSystemLevel):
             vol_normalise_currency_costs=vol_normalise_currency_costs,
             rolls_per_year=rolls_per_year,
             multiply_roll_costs_by=multiply_roll_costs_by,
+            funding_rate=funding_rate,
         )
 
         account_curve = accountCurve(pandl_calculator, weighted=True)

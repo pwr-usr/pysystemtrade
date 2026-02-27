@@ -23,6 +23,21 @@ def carry(raw_carry, smooth_days=90):
     return smooth_carry
 
 
+def negative_carry(raw_carry, smooth_days=90):
+    """
+    Negated carry forecast — reverses the sign of the standard carry rule.
+
+    Useful for asset classes (e.g. crypto perpetuals) where the raw carry
+    signal is structurally inverted relative to expected price direction.
+
+    Same interface as carry(); just negates the output.
+
+    :param raw_carry: The annualised sharpe ratio of rolldown
+    :type raw_carry: pd.DataFrame (assumed Tx1)
+    """
+    return -carry(raw_carry, smooth_days=smooth_days)
+
+
 def relative_carry(smoothed_carry_this_instrument, median_carry_for_asset_class):
     """
     Relative carry rule

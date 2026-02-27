@@ -28,6 +28,7 @@ class pandlCalculationWithCashCostsAndFills(
         rolls_per_year: int,
         vol_normalise_currency_costs: bool = True,
         multiply_roll_costs_by: float = 1.0,
+        funding_rate: pd.Series = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -35,6 +36,7 @@ class pandlCalculationWithCashCostsAndFills(
         self._vol_normalise_currency_costs = vol_normalise_currency_costs
         self._rolls_per_year = rolls_per_year
         self._multiply_roll_costs_by = multiply_roll_costs_by
+        self._funding_rate = funding_rate if funding_rate is not None else pd.Series(dtype=float)
 
     def calculations_df(self):
         #### TEMPORARY
@@ -63,7 +65,28 @@ class pandlCalculationWithCashCostsAndFills(
             costs_as_pd_series
         )
 
+        funding_costs = self.funding_costs_in_instrument_currency()
+        if len(funding_costs) > 0:
+            normalised_costs = normalised_costs.add(funding_costs, fill_value=0.0)
+
         return normalised_costs
+
+    def funding_costs_in_instrument_currency(self) -> pd.Series:
+        funding_rate = self._funding_rate
+        if len(funding_rate) == 0:
+            return pd.Series(dtype=float)
+
+        positions = self.positions.shift(1)
+        price = self.price.ffill()
+        value_per_point = self.value_per_point
+
+        positions_aligned = positions.reindex(funding_rate.index, method="ffill")
+        price_aligned = price.reindex(funding_rate.index, method="ffill")
+
+        cost = -(positions_aligned * price_aligned * funding_rate * value_per_point)
+        cost = cost.dropna()
+
+        return cost
 
     def costs_from_trading_in_instrument_currency_as_series(self) -> pd.Series:
         instrument_currency_costs_as_list = (
