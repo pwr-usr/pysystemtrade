@@ -1,6 +1,8 @@
 from systems.tests.testdata import get_test_object
 from systems.basesystem import System
+import pandas as pd
 import unittest
+from unittest.mock import patch
 
 
 class Test(unittest.TestCase):
@@ -23,6 +25,17 @@ class Test(unittest.TestCase):
         self.assertAlmostEqual(
             self.system.rawdata.daily_returns("SOFR").tail(1).values[0], -0.0225
         )
+
+    def test_daily_returns_across_closed_business_weekdays(self):
+        dates = pd.bdate_range("2024-09-30", periods=4)
+        prices = pd.Series([100.0, float("nan"), float("nan"), 106.0], index=dates)
+
+        with patch.object(self.system.rawdata, "get_daily_prices", return_value=prices):
+            returns = self.system.rawdata.daily_returns("SYNTHETIC_CLOSURE")
+
+        self.assertEqual(returns.loc[dates[1]], 0.0)
+        self.assertEqual(returns.loc[dates[2]], 0.0)
+        self.assertEqual(returns.loc[dates[3]], 6.0)
 
     @unittest.SkipTest
     def test_daily_returns_volatility(self):

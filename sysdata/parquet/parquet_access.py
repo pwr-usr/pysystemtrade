@@ -1,5 +1,9 @@
+import os
+import tempfile
 from pathlib import Path
+
 import pandas as pd
+
 from syscore.exceptions import missingFile
 from syscore.fileutils import (
     files_with_extension_in_resolved_pathname,
@@ -47,9 +51,22 @@ class ParquetAccess(object):
         filename = self.accessor.get_filename_given_data_type_and_identifier(
             data_type=data_type, identifier=identifier
         )
-        data_to_write.to_parquet(
-            filename, coerce_timestamps="us", allow_truncated_timestamps=True
+        destination = Path(filename)
+        temp_file_descriptor, temp_filename = tempfile.mkstemp(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
         )
+        os.close(temp_file_descriptor)
+        temp_path = Path(temp_filename)
+
+        try:
+            data_to_write.to_parquet(
+                temp_path, coerce_timestamps="us", allow_truncated_timestamps=True
+            )
+            os.replace(temp_path, destination)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def read_data_given_data_type_and_identifier(
         self, data_type: str, identifier: str

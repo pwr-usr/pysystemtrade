@@ -5,6 +5,7 @@ Related documents:
 - [Using pysystemtrade as a production trading environment](/docs/production.md)
 - [Backtesting with pysystemtrade](/docs/backtesting.md)
 - [Connecting pysystemtrade to interactive brokers](/docs/IB.md)
+- [Using Tushare for Chinese futures data](/docs/tushare_chinese_futures.md)
 
 It is broken into four parts. The first, [A futures data workflow](#part-1-a-futures-data-workflow), gives an overview of how data is typically processed. It describes how you would get some data from, store it, and create data suitable for simulation and as an initial state for trading. Reading this will also give you a feel for the data in pysystemtrade. The rest of the document goes into much more detail. In [part two](#part-2-overview-of-futures-data-in-pysystemtrade), I provide an overview of how the various data objects fit together. The third part, [storing futures data](#part-3-storing-and-representing-futures-data), then describes in detail each of the components used to futures data. In the [final part](#part-4-interfaces),  you will see how we provide an interface between the data storage objects and the simulation / production code.
 

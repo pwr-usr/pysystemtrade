@@ -45,7 +45,7 @@ class parquetFuturesAdjustedPricesData(futuresAdjustedPricesData):
         raw_price_df = self.parquet.read_data_given_data_type_and_identifier(
             data_type=ADJPRICE_COLLECTION, identifier=instrument_code
         )
-        return futuresAdjustedPrices(raw_price_df.squeeze())
+        return futuresAdjustedPrices(raw_price_df.iloc[:, 0])
 
     def _delete_adjusted_prices_without_any_warning_be_careful(
         self, instrument_code: str

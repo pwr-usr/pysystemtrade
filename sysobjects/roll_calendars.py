@@ -116,6 +116,41 @@ class rollCalendar(pd.DataFrame):
 
         return checks_okay
 
+    def check_is_valid(
+        self, dict_of_futures_contract_prices: dictFuturesContractFinalPrices
+    ) -> bool:
+        """Check the minimal structural and price invariants for stitching."""
+
+        if self.empty:
+            print("WARNING: Roll calendar is empty")
+            return False
+
+        dates_are_valid = self.check_if_date_index_monotonic()
+        if not dates_are_valid:
+            return False
+
+        current_contracts = self.current_contract.astype(str)
+        next_contracts = self.next_contract.astype(str)
+        if len(self) > 1:
+            chain_is_unbroken = (
+                current_contracts.iloc[1:].to_numpy()
+                == next_contracts.iloc[:-1].to_numpy()
+            )
+            if not chain_is_unbroken.all():
+                first_bad_offset = int(np.flatnonzero(~chain_is_unbroken)[0]) + 1
+                print(
+                    "WARNING: Roll calendar contract chain is broken at %s: "
+                    "current contract %s does not match previous next contract %s"
+                    % (
+                        self.index[first_bad_offset],
+                        current_contracts.iloc[first_bad_offset],
+                        next_contracts.iloc[first_bad_offset - 1],
+                    )
+                )
+                return False
+
+        return self.check_dates_are_valid_for_prices(dict_of_futures_contract_prices)
+
 
 def _check_row_of_row_calendar(
     calendar_row: pd.Series,

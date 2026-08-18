@@ -3,6 +3,7 @@ process_configuration_start_time:
   run_stack_handler: '00:01'
   run_capital_update: '01:00'
   run_daily_prices_updates: '20:00'
+  run_daily_tushare_price_updates: '18:00'
   run_daily_fx_and_contract_updates: '07:00'
   run_daily_update_multiple_adjusted_prices: '23:00'
   run_systems: '20:05'
@@ -16,6 +17,7 @@ process_configuration_stop_time:
   run_stack_handler: '19:45'
   run_capital_update: '19:50'
   run_daily_prices_updates: '23:50'
+  run_daily_tushare_price_updates: '23:50'
   run_daily_fx_and_contract_updates: '23:50'
   run_daily_update_multiple_adjusted_prices: '23:50'
   run_systems: '23:50'
@@ -49,6 +51,9 @@ process_configuration_methods:
       max_executions: 1
   run_daily_prices_updates:
     update_historical_prices:
+      max_executions: 1
+  run_daily_tushare_price_updates:
+    update_tushare_futures:
       max_executions: 1
   run_daily_fx_and_contract_updates:
     update_fx_prices:

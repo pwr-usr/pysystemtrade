@@ -1,3 +1,5 @@
+import pytest
+
 from sysinit.futures.rollcalendars_from_db_prices_to_csv import (
     build_and_write_roll_calendar,
     check_saved_roll_calendar,
@@ -39,16 +41,15 @@ class TestFuturesInit:
             check_before_writing=False,
         )
 
-    def test_check_saved_roll_calendar(self):
-        """
-        Tests the function that checks a roll calendar generated from individual contract prices
-        """
+    def test_check_saved_roll_calendar_rejects_invalid_timestamps(self):
+        """The legacy fixture uses roll timestamps absent from its raw prices."""
         sample_prices = csvFuturesContractPriceData(
             datapath="sysinit.futures.tests.price", config=self.csv_config
         )
 
-        check_saved_roll_calendar(
-            "AUD",
-            input_datapath="sysinit.futures.tests.roll_cal",
-            input_prices=sample_prices,
-        )
+        with pytest.raises(ValueError, match="Saved roll calendar for AUD is invalid"):
+            check_saved_roll_calendar(
+                "AUD",
+                input_datapath="sysinit.futures.tests.roll_cal",
+                input_prices=sample_prices,
+            )

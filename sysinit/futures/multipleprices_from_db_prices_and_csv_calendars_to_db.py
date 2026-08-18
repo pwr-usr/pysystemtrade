@@ -26,15 +26,14 @@ from sysdata.csv.csv_multiple_prices import csvFuturesMultiplePricesData
 from sysdata.csv.csv_roll_parameters import csvRollParametersData
 from sysinit.futures.build_roll_calendars import adjust_to_price_series
 from sysobjects.multiple_prices import futuresMultiplePrices
+from sysobjects.roll_calendars import rollCalendar
 
 
-diag_prices = diagPrices()
-
-
-def _get_data_inputs(csv_roll_data_path, csv_multiple_data_path):
+def _get_data_inputs(csv_roll_data_path, csv_multiple_data_path, data=arg_not_supplied):
     csv_roll_calendars = csvRollCalendarData(csv_roll_data_path)
-    db_individual_futures_prices = diag_prices.db_futures_contract_price_data
-    db_multiple_prices = diag_prices.db_futures_multiple_prices_data
+    prices = diagPrices() if data is arg_not_supplied else diagPrices(data)
+    db_individual_futures_prices = prices.db_futures_contract_price_data
+    db_multiple_prices = prices.db_futures_multiple_prices_data
     csv_multiple_prices = csvFuturesMultiplePricesData(csv_multiple_data_path)
 
     return (
@@ -50,13 +49,14 @@ def process_multiple_prices_all_instruments(
     csv_roll_data_path=arg_not_supplied,
     ADD_TO_DB=True,
     ADD_TO_CSV=False,
+    data=arg_not_supplied,
 ):
     (
         _not_used1,
         db_individual_futures_prices,
         _not_used2,
         _not_used3,
-    ) = _get_data_inputs(csv_roll_data_path, csv_multiple_data_path)
+    ) = _get_data_inputs(csv_roll_data_path, csv_multiple_data_path, data=data)
     instrument_list = (
         db_individual_futures_prices.get_list_of_instrument_codes_with_merged_price_data()
     )
@@ -69,6 +69,7 @@ def process_multiple_prices_all_instruments(
             csv_roll_data_path=csv_roll_data_path,
             ADD_TO_DB=ADD_TO_DB,
             ADD_TO_CSV=ADD_TO_CSV,
+            data=data,
         )
 
 
@@ -82,6 +83,7 @@ def process_multiple_prices_single_instrument(
     roll_calendar=arg_not_supplied,
     ADD_TO_DB=True,
     ADD_TO_CSV=False,
+    data=arg_not_supplied,
 ):
     if target_instrument_code is arg_not_supplied:
         target_instrument_code = instrument_code
@@ -90,7 +92,7 @@ def process_multiple_prices_single_instrument(
         db_individual_futures_prices,
         db_multiple_prices,
         csv_multiple_prices,
-    ) = _get_data_inputs(csv_roll_data_path, csv_multiple_data_path)
+    ) = _get_data_inputs(csv_roll_data_path, csv_multiple_data_path, data=data)
 
     dict_of_futures_contract_prices = (
         db_individual_futures_prices.get_merged_prices_for_instrument(instrument_code)
@@ -101,22 +103,41 @@ def process_multiple_prices_single_instrument(
 
     if roll_calendar is arg_not_supplied:
         roll_calendar = csv_roll_calendars.get_roll_calendar(instrument_code)
+    if roll_calendar.empty:
+        raise ValueError(
+            "Invalid roll calendar for %s: calendar is empty" % instrument_code
+        )
 
-    # Add first phantom row so that the last calendar entry won't be consumed by adjust_roll_calendar()
     if roll_parameters is arg_not_supplied:
         m = csvRollParametersData()
         roll_parameters = m.get_roll_parameters(instrument_code)
 
-    roll_calendar = add_phantom_row(
-        roll_calendar, dict_of_futures_contract_closing_prices, roll_parameters
-    )
-
     if adjust_calendar_to_prices:
-        roll_calendar = adjust_roll_calendar(instrument_code, roll_calendar)
+        # The adjuster treats its final row as a boundary rather than emitting
+        # it. Add a temporary phantom so the final real row is retained.
+        calendar_for_adjustment = add_phantom_row(
+            roll_calendar, dict_of_futures_contract_closing_prices, roll_parameters
+        )
+        effective_roll_calendar = adjust_roll_calendar(
+            instrument_code, calendar_for_adjustment, data=data
+        )
+    else:
+        effective_roll_calendar = roll_calendar
 
-    # Second phantom row is needed in order to process the whole set of closing prices (and not stop after the last roll-over)
+    # Validate the actual reviewed/adjusted calendar. The final phantom has no
+    # same-day raw quote by design, so it must be added only after this gate.
+    effective_roll_calendar = rollCalendar(effective_roll_calendar)
+    if not effective_roll_calendar.check_is_valid(
+        dict_of_futures_contract_closing_prices
+    ):
+        raise ValueError("Invalid roll calendar for %s" % instrument_code)
+
+    # A final phantom row lets the builder consume all prices after the last
+    # real roll rather than stopping at that roll date.
     roll_calendar = add_phantom_row(
-        roll_calendar, dict_of_futures_contract_closing_prices, roll_parameters
+        effective_roll_calendar,
+        dict_of_futures_contract_closing_prices,
+        roll_parameters,
     )
 
     multiple_prices = futuresMultiplePrices.create_from_raw_data(
@@ -137,8 +158,9 @@ def process_multiple_prices_single_instrument(
     return multiple_prices
 
 
-def adjust_roll_calendar(instrument_code, roll_calendar):
-    db_prices_per_contract = diag_prices.db_futures_contract_price_data
+def adjust_roll_calendar(instrument_code, roll_calendar, data=arg_not_supplied):
+    prices = diagPrices() if data is arg_not_supplied else diagPrices(data)
+    db_prices_per_contract = prices.db_futures_contract_price_data
     print("Getting prices to adjust roll calendar")
     dict_of_prices = db_prices_per_contract.get_merged_prices_for_instrument(
         instrument_code

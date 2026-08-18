@@ -8,11 +8,6 @@ from sysdata.csv.csv_roll_parameters import csvRollParametersData
 from sysdata.futures.rolls_parameters import rollParametersData
 from sysproduction.data.prices import get_valid_instrument_code_from_user, diagPrices
 
-
-diag_prices = diagPrices()
-
-parquet_futures_contract_price_data = diag_prices.db_futures_contract_price_data
-
 """
 Generate a 'best guess' roll calendar based on some price data for individual contracts
 
@@ -36,7 +31,7 @@ def build_and_write_roll_calendar(
         print("Writing to %s" % output_datapath)
 
     if input_prices is arg_not_supplied:
-        prices = parquet_futures_contract_price_data
+        prices = diagPrices().db_futures_contract_price_data
     else:
         prices = input_prices
 
@@ -58,11 +53,8 @@ def build_and_write_roll_calendar(
         dict_of_futures_contract_prices, roll_parameters
     )
 
-    # checks - this might fail
-    roll_calendar.check_if_date_index_monotonic()
-
-    # this should never fail
-    roll_calendar.check_dates_are_valid_for_prices(dict_of_futures_contract_prices)
+    if not roll_calendar.check_is_valid(dict_of_futures_contract_prices):
+        raise ValueError("Generated roll calendar for %s is invalid" % instrument_code)
 
     # Write to csv
     # Will not work if an existing calendar exists
@@ -99,7 +91,7 @@ def check_saved_roll_calendar(
     roll_calendar = csv_roll_calendars.get_roll_calendar(instrument_code)
 
     if input_prices is arg_not_supplied:
-        prices = parquet_futures_contract_price_data
+        prices = diagPrices().db_futures_contract_price_data
     else:
         prices = input_prices
 
@@ -110,11 +102,8 @@ def check_saved_roll_calendar(
 
     print(roll_calendar)
 
-    # checks - this might fail
-    roll_calendar.check_if_date_index_monotonic()
-
-    # this should never fail
-    roll_calendar.check_dates_are_valid_for_prices(dict_of_futures_contract_prices)
+    if not roll_calendar.check_is_valid(dict_of_futures_contract_prices):
+        raise ValueError("Saved roll calendar for %s is invalid" % instrument_code)
 
     return roll_calendar
 

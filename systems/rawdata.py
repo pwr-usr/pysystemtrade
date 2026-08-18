@@ -123,7 +123,10 @@ class RawData(SystemStage):
         2015-12-11  0.1075
         """
         instrdailyprice = self.get_daily_prices(instrument_code)
-        dailyreturns = instrdailyprice.diff()
+        # The business-day index includes weekdays when the local exchange is
+        # closed. Treat those missing prices as unchanged so the reopening
+        # return spans the closure instead of disappearing after a NaN.
+        dailyreturns = instrdailyprice.ffill().diff()
 
         return dailyreturns
 

@@ -213,7 +213,7 @@ def _get_current_next_carry_data(
     end_of_period = min([roll_date_info.end_of_roll_period, last_date_in_data])
 
     current_contract_data = current_contract_data.sort_index()
-    current_price_data = current_contract_data[start_of_period:end_of_period]
+    current_price_data = current_contract_data[start_of_period:end_of_period].dropna()
 
     carry_price_data = _get_carry_price_data(
         contract_date_info, current_price_data, roll_date_info
@@ -260,7 +260,7 @@ def _get_next_price_data(
 
         next_price_data = next_price_data_for_contract[
             roll_date_info.start_of_roll_period : roll_date_info.end_of_roll_period
-        ]
+        ].reindex(current_price_data.index)
 
     return next_price_data
 
@@ -297,7 +297,7 @@ def _get_carry_price_data(
         carry_price_data_for_contract = carry_price_data_for_contract.sort_index()
         carry_price_data = carry_price_data_for_contract[
             roll_date_info.start_of_roll_period : roll_date_info.end_of_roll_period
-        ]
+        ].reindex(current_price_data.index)
 
     return carry_price_data
 
