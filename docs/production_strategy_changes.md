@@ -41,7 +41,7 @@ If you are using a completely vanilla 'out of the box' strategy that can be run 
 - [Classic system](/sysproduction/strategy_code/run_system_classic.py)
 - [Dynamic system](/sysproduction/strategy_code/run_dynamic_optimised_system.py) (as described [here](https://qoppac.blogspot.com/2021/10/mr-greedy-and-tale-of-minimum-tracking.html))
 
-Otherwise, you will need to create your own runSystem class. There is an example [here](/examples/production/example_of_custom_run_system.py). Notice that it overrides `system_method` to create a different system from the default; that in turn is built up from some custom stages.
+Otherwise, you will need to create your own runSystem class. There is an example [here](/examples/production/custom_run_system.py). Notice that it overrides `system_method` to create a different system from the default; that in turn is built up from some custom stages.
 
 You may also need to override the `run_backtest` method if you need your strategy to do something different in terms of saving optimised positions (again that is the principal difference between the classic and dynamic systems).
 
@@ -78,8 +78,8 @@ process_configuration_methods:
     ... existing systems ...
     dynamic_TF_carry:
       max_executions: 1
-      object: private.systems.dynamic_carry_trend.run_system.runMySystemCarryTrendDynamic
-      backtest_config_filename: private.systems.dynamic_carry_trend.production.yaml
+      object: examples.production.custom_run_system.runMySystemCarryTrendDynamic
+      backtest_config_filename: systems.provided.rob_system.config.yaml
   run_strategy_order_generator:
     ... existing systems ...
     dynamic_TF_carry:
@@ -97,7 +97,7 @@ strategy_list:
   ... existing systems ...
   dynamic_TF_carry:
     load_backtests:
-      object: private.systems.dynamic_carry_trend.run_system.runMySystemCarryTrendDynamic
+      object: examples.production.custom_run_system.runMySystemCarryTrendDynamic
       function: system_method
     reporting_code:
       function: sysproduction.strategy_code.report_system_dynamic_optimised.report_system_dynamic
@@ -215,8 +215,6 @@ Obviously if you have no existing position then it doesn't matter if you use don
 ### Actual optimal positions
 
 The actual optimal positions, used to generate instrument orders, are of simple integer values. In addition, they also contain a lot of hidden diagnostic information about the optimisation, which is displayed by the strategy report and also by the interactive_diagnostics function to display optimal positions.
-
-
 
 
 

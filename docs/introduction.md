@@ -5,7 +5,7 @@ Notice that you will see different results than shown here, as you will be using
 
 ## A simple trading rule
 
-(code is [here](/examples/introduction/asimpletradingrule.py) )
+(code is [here](/examples/introduction/simple_trading_rule.py) )
 
 As systematic traders we believe that the future will be at least a bit like the past. So first of all we need some past data. In principle past data can come from many places, but to begin with we'll get it from some pre-baked CSV files:
 
@@ -187,7 +187,7 @@ account.gross.ann_mean()  ## annual mean for gross returns, also costs (there ar
 
 ## A simple system
 
-(code is [here](/examples/introduction/simplesystem.py) )
+(code is [here](/examples/introduction/simple_system.py) )
 
 This is all very well, but what we probably want to do is build a trading **system** composed of several trading rules, and a few more instruments.
 
@@ -664,7 +664,7 @@ Similarly, for the ewmac8 rule we've specified a data source `data.daily_prices`
 
 Normally we wouldn't create a system by adding each stage manually (importing and creating long lists of stage objects). Instead, you can use a 'pre-baked' system, and then modify it as required.
 
-For example here is a pre-baked version of the previous example (code is [here](/examples/introduction/prebakedsystems.py) ):
+For example here is a pre-baked version of the previous example (code is [here](/examples/introduction/prebuilt_systems.py) ):
 
 ```python
 from systems.provided.example.simplesystem import simplesystem
@@ -704,7 +704,7 @@ For the vast majority of the time this will be how you create new systems.
 
 Let's now see how we might use another 'pre-baked' system, in this case the staunch systems trader example defined in chapter 15 of my book. Here again we default to using csv data.
 
-(Code is [here](/examples/introduction/prebakedsystems.py) )
+(Code is [here](/examples/introduction/prebuilt_systems.py) )
 
 ```python
 from systems.provided.futures_chapter15.basesystem import futures_system

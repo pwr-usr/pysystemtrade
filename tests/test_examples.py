@@ -86,7 +86,7 @@ def portfolio():
 
 class TestExamples:
     """
-    This is (mostly) the code from 'examples.introduction.simplesystem',
+    This is (mostly) the code from 'examples.introduction.simple_system',
     but without graph plotting
     """
 
@@ -395,7 +395,7 @@ class TestExamples:
     @pytest.mark.slow  # will be skipped unless run with 'pytest --runslow'
     def test_prebaked_simple_system(self):
         """
-        This is the simple system from 'examples.introduction.prebakedsimplesystems'
+        This is the simple system from 'examples.introduction.prebuilt_systems'
         """
         my_system = simplesystem()
         print(my_system)
@@ -404,7 +404,7 @@ class TestExamples:
     @pytest.mark.slow  # will be skipped unless run with 'pytest --runslow'
     def test_prebaked_from_confg(self):
         """
-        This is the config system from 'examples.introduction.prebakedsimplesystems'
+        This is the config system from 'examples.introduction.prebuilt_systems'
         """
         my_config = Config("systems.provided.example.simplesystemconfig.yaml")
         my_data = csvFuturesSimData()
@@ -414,7 +414,7 @@ class TestExamples:
     @pytest.mark.slow  # will be skipped unless run with 'pytest --runslow'
     def test_prebaked_chapter15(self):
         """
-        This is (mostly) the chapter 15 system from 'examples.introduction.prebakedsimplesystems'
+        This is (mostly) the chapter 15 system from 'examples.introduction.prebuilt_systems'
         but without graph plotting
         """
         system = base_futures_system()

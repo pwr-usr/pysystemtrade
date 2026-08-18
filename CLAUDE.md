@@ -23,7 +23,7 @@ preserving the repository's native storage and simulation interfaces.
 |---|---|
 | Architecture, design decisions (FINAL=close, CNH FX, naming, roll methodology), all CLI entry points and workflows, failure model | [docs/tushare_chinese_futures.md](docs/tushare_chinese_futures.md) |
 | Inspecting every data stage (vendor API → catalogue → parquet/mongo → calendars → multiple/adjusted → sim), with runnable snippets and health checks | [docs/tushare_data_inspection.md](docs/tushare_data_inspection.md) |
-| Historical evidence behind the currently accepted roll parameters | `private/tushare_roll_evidence_2026-08-03.csv` |
+| Historical evidence behind the currently accepted roll parameters | `private/evidence/tushare_roll_evidence.csv` |
 | Upstream data/production concepts (storage objects, roll calendars, sim) | [docs/data.md](docs/data.md), [docs/production.md](docs/production.md) |
 
 Key entry points: seed `python -m sysinit.futures.seed_price_data_from_tushare`,
