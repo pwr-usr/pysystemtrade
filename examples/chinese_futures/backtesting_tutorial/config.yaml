@@ -1,0 +1,55 @@
+# A deliberately small, readable system for the tutorial notebook.
+
+start_date: "2000-01-01"
+
+trading_rules:
+  ewmac16_64:
+    function: systems.provided.rules.ewmac.ewmac
+    data:
+      - rawdata.get_daily_prices
+      - rawdata.daily_returns_volatility
+    other_args:
+      Lfast: 16
+      Lslow: 64
+    forecast_scalar: 3.75
+  ewmac32_128:
+    function: systems.provided.rules.ewmac.ewmac
+    data:
+      - rawdata.get_daily_prices
+      - rawdata.daily_returns_volatility
+    other_args:
+      Lfast: 32
+      Lslow: 128
+    forecast_scalar: 2.65
+  carry:
+    function: systems.provided.rules.carry.carry
+    data:
+      - rawdata.raw_carry
+    other_args:
+      smooth_days: 90
+    forecast_scalar: 30.0
+
+forecast_cap: 20.0
+forecast_weights:
+  ewmac16_64: 0.30
+  ewmac32_128: 0.20
+  carry: 0.50
+forecast_div_multiplier: 1.30
+
+percentage_vol_target: 16.0
+notional_trading_capital: 10000000
+base_currency: CNH
+
+instrument_weights:
+  SHFE_RB: 0.25
+  DCE_M: 0.25
+  CFFEX_IF: 0.25
+  CFFEX_T: 0.25
+instrument_div_multiplier: 1.50
+
+buffer_method: forecast
+buffer_size: 0.10
+buffer_trade_to_edge: true
+
+use_SR_costs: false
+vol_normalise_currency_costs: true

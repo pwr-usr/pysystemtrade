@@ -1,0 +1,105 @@
+# Native system config. Experiment knobs live in the notebook, not here.
+
+trading_rules:
+  carry10:
+    function: systems.provided.rules.carry.carry
+    data: [rawdata.raw_carry]
+    other_args: {smooth_days: 10}
+  carry30:
+    function: systems.provided.rules.carry.carry
+    data: [rawdata.raw_carry]
+    other_args: {smooth_days: 30}
+  carry60:
+    function: systems.provided.rules.carry.carry
+    data: [rawdata.raw_carry]
+    other_args: {smooth_days: 60}
+  carry125:
+    function: systems.provided.rules.carry.carry
+    data: [rawdata.raw_carry]
+    other_args: {smooth_days: 125}
+
+  breakout40:
+    function: examples.chinese_futures.carry_donchian_lab.system.causal_breakout
+    data: [rawdata.get_daily_prices]
+    other_args: {lookback: 40}
+  breakout80:
+    function: examples.chinese_futures.carry_donchian_lab.system.causal_breakout
+    data: [rawdata.get_daily_prices]
+    other_args: {lookback: 80}
+  breakout160:
+    function: examples.chinese_futures.carry_donchian_lab.system.causal_breakout
+    data: [rawdata.get_daily_prices]
+    other_args: {lookback: 160}
+
+  binary40:
+    function: examples.chinese_futures.carry_donchian_lab.system.persistent_binary_donchian
+    data: [rawdata.get_daily_prices]
+    other_args: {lookback: 40}
+  binary80:
+    function: examples.chinese_futures.carry_donchian_lab.system.persistent_binary_donchian
+    data: [rawdata.get_daily_prices]
+    other_args: {lookback: 80}
+  binary160:
+    function: examples.chinese_futures.carry_donchian_lab.system.persistent_binary_donchian
+    data: [rawdata.get_daily_prices]
+    other_args: {lookback: 160}
+
+forecast_scalars:
+  carry10: 27.815707053556984
+  carry30: 28.384062881349813
+  carry60: 28.40072429176199
+  carry125: 29.366474500729886
+  breakout40: 0.7036929411910525
+  breakout80: 0.726260784624834
+  breakout160: 0.7388310187414805
+  binary40: 10.0
+  binary80: 10.0
+  binary160: 10.0
+
+# Default 70/30 carry / continuous mix. The factory overwrites this when the
+# notebook sweeps another carry weight or switches trend kind.
+forecast_weights:
+  carry10: 0.175
+  carry30: 0.175
+  carry60: 0.175
+  carry125: 0.175
+  breakout40: 0.10
+  breakout80: 0.10
+  breakout160: 0.10
+
+forecast_cap: 20.0
+forecast_div_multiplier: 1.0
+use_forecast_scale_estimates: false
+use_forecast_weight_estimates: false
+use_forecast_div_mult_estimates: false
+forecast_weight_ewma_span: 1
+forecast_post_ceiling_cost_SR: 999999
+
+notional_trading_capital: 100000000
+percentage_vol_target: 16.0
+base_currency: CNH
+capital_multiplier: {func: syscore.capital.fixed_capital}
+
+instrument_div_multiplier: 2.5
+use_instrument_weight_estimates: false
+use_instrument_div_mult_estimates: false
+instrument_weight_ewma_span: 1
+
+buffer_method: forecast
+buffer_size: 0.10
+buffer_trade_to_edge: true
+
+use_SR_costs: false
+vol_normalise_currency_costs: false
+multiply_roll_costs_by: 0.5
+
+volatility_calculation:
+  func: sysquant.estimators.vol.mixed_vol_calc
+  name_returns_attr_in_rawdata: daily_returns
+  multiplier_to_get_daily_vol: 1.0
+  days: 35
+  min_periods: 10
+  slow_vol_years: 20
+  proportion_of_slow_vol: 0.35
+  vol_abs_min: 0.0000000001
+  backfill: false
