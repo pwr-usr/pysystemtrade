@@ -1,58 +1,33 @@
-# Tushare data: inspecting every stage
+# 中国期货数据检查
 
-Runnable recipes for looking at the data as it moves through the pipeline:
+数据更新操作见 [Tushare 数据入口](tushare_chinese_futures.md)。下面的例子直接使用原生对象。
 
-```text
-vendor API → catalogue records → per-contract prices (parquet) + contract
-state (mongo) + CNHUSD (parquet)
-
-historical initialization: manual rollconfig + reviewed roll calendar (CSV)
-    → multiple prices (parquet) → adjusted prices (parquet) → simulation
-
-daily/live continuation: final multiple-price row + new contract prices
-    → updated multiple and adjusted prices
-```
-
-Prerequisites for anything below: the mongo container is up
-(`docker start pysystemtrade-mongo`) and, for stages 1–2 only, the token is
-exported (`TUSHARE_TOKEN`). Everything runs with `uv run python`. Storage
-paths come from `private/private_config.yaml` (`parquet_store`, `mongo_*`),
-so plain `dataBlob()` / `diagPrices()` always point at the right stores.
-
-## 1. Raw vendor responses
+## 读取本地回测数据
 
 ```python
-from sysdata.tushare.client import TushareClient
-client = TushareClient()
-print(client.fut_basic(exchange="SHFE").head())            # contract catalogue, one exchange
-print(client.fut_daily(ts_code="CU2609.SHF").head())       # raw daily bars, one contract
-print(client.fx_daily(ts_code="USDCNH.FXCM", start_date="20260101", end_date="20260131").head())
+from sysdata.sim.db_futures_sim_data import dbFuturesSimData
+
+data = dbFuturesSimData()
+multiple = data.get_multiple_prices("SHFE_RB")
+adjusted = data.get_backadjusted_futures_price("SHFE_RB")
+print(multiple.tail())
+print(adjusted.tail())
 ```
 
-This is the untransformed vendor truth — useful when deciding whether an
-oddity is Tushare's or ours. `close` becomes FINAL; `settle` is fetched but
-never stored.
+`PRICE` 是未复权当前合约价格，`FORWARD` 是下一张持有合约，`CARRY` 是计算期限结构的参照合约。对应的 `*_CONTRACT` 列保存合约月份。加法复权保持非换月日价格差，适合观察趋势、计算价格差波动率及现金盈亏。名义金额使用未复权价格和合约乘数。
 
-## 2. Validated catalogue (vendor contract → internal record)
+应用审核后的流动性时段：
 
 ```python
-from sysdata.tushare.client import TushareClient
-from sysdata.tushare.source import TushareFuturesPriceSource
-source = TushareFuturesPriceSource(TushareClient())
-result = source.fetch_contract_catalogue_result()
-print(len(result.contracts), "records; unmapped families:", result.unmapped_families)
-records = [r for r in result.contracts if r.instrument_code == "DCE_FB"]
-print(records[0])   # contract_date, ts_code, exact expiry, era price window
+data = dbFuturesSimData(
+    trading_windows="data/futures/csvconfig/instrument_trading_windows.csv"
+)
+print(data.get_trading_windows("DCE_FB_OLD"))
 ```
 
-Without hitting the API: `python -m sysinit.futures.seed_price_data_from_tushare --dry-run`
-prints the vendor/internal counts after full validation.
+时段表列为 `Instrument, Start, End, Reason, ReviewDate`，起止日均包含。一个品种可有多段有效历史；空起止行表示尚无可用时段。研究中每段独立建立波动率与规则预热，段间保持零仓位。全历史审核属于事后研究口径。
 
-## 3. Per-contract prices (parquet)
-
-Files live at `<parquet_store>/futures_contract_prices/` keyed
-`Day@SHFE_CU#20260900.parquet` (daily) and `SHFE_CU#20260900.parquet`
-(merged; identical content for this daily-only source).
+## 查看单合约原始日线
 
 ```python
 from sysdata.data_blob import dataBlob
@@ -60,212 +35,50 @@ from sysproduction.data.prices import diagPrices
 from sysobjects.contracts import futuresContract
 from syscore.dateutils import DAILY_PRICE_FREQ
 
-store = diagPrices(dataBlob()).db_futures_contract_price_data
-contract = futuresContract("SHFE_CU", "20260900")
-daily = store.get_prices_at_frequency_for_contract_object(contract, frequency=DAILY_PRICE_FREQ)
-print(daily.tail())        # OPEN/HIGH/LOW/FINAL/VOLUME, 23:00 naive stamps
-merged = store.get_merged_prices_for_contract_object(contract)
-assert daily.equals(merged)
-
-# every stored contract for an instrument at once:
-all_prices = store.get_merged_prices_for_instrument("SHFE_CU")
-print(len(all_prices), "contracts;", sorted(all_prices.keys())[:3])
+with dataBlob() as blob:
+    store = diagPrices(blob).db_futures_contract_price_data
+    contract = futuresContract("SHFE_RB", "20270100")
+    daily = store.get_prices_at_frequency_for_contract_object(
+        contract, frequency=DAILY_PRICE_FREQ
+    )
+    merged = store.get_merged_prices_for_contract_object(contract)
+    print(daily.tail())
+    print("Day / merged 相同：", daily.equals(merged))
 ```
 
-(Or read a file directly: `pd.read_parquet("<parquet_store>/futures_contract_prices/SHFE_CU#20260900.parquet")`.)
+日线字段为 `OPEN, HIGH, LOW, FINAL, VOLUME`，时间归一到交易日 23:00。零成交量是流动性审阅的证据；原始存储保留这些观察。
 
-Expectations: FINAL equals the vendor `close`; zero-volume rows are absent
-(cleaning drops them, so a series starts when the contract actually trades);
-fibreboard vendor contracts crossing 2019-12 appear under both `DCE_FB_OLD`
-and `DCE_FB`, sliced at the era boundary.
-
-## 4. Contract state (mongo)
+## 直接读取 Tushare 数据源
 
 ```python
 from sysdata.data_blob import dataBlob
-from sysproduction.data.contracts import dataContracts
-contracts = dataContracts(dataBlob())
-chain = contracts.get_all_contract_objects_for_instrument_code("SHFE_CU")
-one = contracts.get_contract_from_db(chain[-1])
-print(one.date_str, one.expiry_date, one.currently_sampling)
+from sysdata.tushare.source import tushareFuturesContractData, tushareFuturesContractPriceData
+from sysobjects.contracts import futuresContract
+from syscore.dateutils import DAILY_PRICE_FREQ
+
+with dataBlob(class_list=[tushareFuturesContractData, tushareFuturesContractPriceData]) as blob:
+    contracts = blob.tushare_futures_contract
+    print(contracts.get_all_contract_objects_for_instrument_code("SHFE_RB"))
+    daily = blob.tushare_futures_contract_price.get_prices_at_frequency_for_contract_object(
+        futuresContract("SHFE_RB", "20270100"), frequency=DAILY_PRICE_FREQ,
+        start_date="2026-09-01", end_date="2026-09-07"
+    )
+    print(daily)
 ```
 
-`expiry_date` is the exact Tushare delist date (not an approximation);
-`currently_sampling` is on exactly for currently-listed contracts. Shell
-alternative: `docker exec pysystemtrade-mongo mongosh production --quiet --eval
-'db.futures_contracts.countDocuments({})'` (expect ≈ 10,914).
+`tushareFuturesContractData`、`tushareFuturesContractPriceData`、`tushareFxPricesData` 分别继承原生合约、价格、汇率接口。它们通过 `dataBlob.tushare_connection` 共用目录和客户端；读取供应方数据不会写入本地库。导入统一通过 `update_tushare_futures` 完成。
 
-## 5. CNHUSD (parquet)
+## 解读异常
 
-```python
-from sysdata.data_blob import dataBlob
-from sysproduction.data.currency_data import dataCurrency
-fx = dataCurrency(dataBlob()).get_fx_prices("CNHUSD")
-print(fx.tail())   # inverted USDCNH.FXCM bid/ask midpoint, from 2012-02-18
-```
+| 观察 | 检查方式 |
+|---|---|
+| PRICE 有值，CARRY 缺失 | 核对 carry 合约代码及同日真实报价；报告缺失行数与日期 |
+| 长期零成交、重复报价 | 逐合约检查成交量和实际价格变化，审阅可交易时段 |
+| 换月附近名义敞口跳升 | 对照当天 PRICE_CONTRACT、前日 FORWARD、持仓手数与资金 |
+| 初期波动率接近零 | 先检查数据和预热，再采用明确的品种价格点波动率下限 |
+| `retained_previous` | 查看拼接诊断，原连续价格已保留 |
+| `retained_reviewed_episodes` | 独立历史段受审核表保护，新增段需要审核 |
+| `retained_manual_calendar` | 人工合约链完整保留，追加换月需要复核 |
+| `failed` 且提示缺少独立段价格 | 本地 multiple / adjusted 尚不完整，按同一审核批次成套初始化 |
 
-## 6. Roll parameters (CSV — manually maintained)
-
-`data/futures/csvconfig/rollconfig.csv` is the policy source. Inspect the
-native object exactly as the calendar and production-roll code will use it:
-
-```python
-from sysdata.csv.csv_roll_parameters import csvRollParametersData
-params = csvRollParametersData().get_roll_parameters("SHFE_RB")
-print(params)
-```
-
-The meanings of `HoldRollCycle`, `PricedRollCycle`, `RollOffsetDays`,
-`CarryOffset`, and `ExpiryOffset` are documented in
-[data.md](/docs/data.md). Research can inform a manual edit, but there is no
-automatic proposal or config-write stage.
-
-## 7. Candidate and reviewed roll calendars (CSV)
-
-`data/futures/roll_calendars_csv/<INSTRUMENT>.csv`: one row per roll
-(`DATE_TIME, current_contract, next_contract, carry_contract`).
-
-Build a candidate in a temporary directory, never directly over the reviewed
-calendar:
-
-```python
-from pathlib import Path
-from sysinit.futures.rollcalendars_from_db_prices_to_csv import (
-    build_and_write_roll_calendar,
-)
-
-Path("/tmp/pysystemtrade-roll-calendars").mkdir(parents=True, exist_ok=True)
-candidate = build_and_write_roll_calendar(
-    "SHFE_RB",
-    output_datapath="/tmp/pysystemtrade-roll-calendars",
-    check_before_writing=False,
-)
-print(candidate)
-```
-
-Inspect or edit the temporary CSV, then validate it against the stored raw
-contract prices:
-
-```python
-from sysinit.futures.rollcalendars_from_db_prices_to_csv import (
-    check_saved_roll_calendar,
-)
-
-checked = check_saved_roll_calendar(
-    "SHFE_RB", input_datapath="/tmp/pysystemtrade-roll-calendars"
-)
-print(checked)
-```
-
-Sanity: contiguous chain (each row's `current` equals the previous row's
-`next`); carry earlier(−1)/later(+1) than current per `rollconfig.csv`.
-Both current and incoming contracts need real prices at every roll timestamp.
-After successful review, deliberately copy that one file into
-`data/futures/roll_calendars_csv/` and run:
-
-```bash
-uv run python -m sysinit.futures.rebuild_tushare_multiple_adjusted \
-  --instrument SHFE_RB
-```
-
-The saved liquid-era bounds are also policy: `SHFE_RU` starts from raw
-contract `19990100`, `SHFE_FU` from `20190100`, and `CZCE_SF`/`CZCE_SM` from
-`20170100`. Preserve those bounds when replacing those calendars.
-
-## 8. Multiple prices (parquet)
-
-```python
-from sysdata.data_blob import dataBlob
-from sysproduction.data.prices import diagPrices
-multiple = diagPrices(dataBlob()).get_multiple_prices("SHFE_RB")
-print(multiple.tail())                       # PRICE/CARRY/FORWARD + *_CONTRACT columns
-rolls = (multiple["PRICE_CONTRACT"] != multiple["PRICE_CONTRACT"].shift()).sum()
-print("rolls in series:", rolls - 1)
-print("carry coverage:", f"{multiple['CARRY'].notna().mean():.0%}")
-```
-
-For carry −1 instruments `CARRY_CONTRACT < PRICE_CONTRACT` (earlier
-delivery); expect gaps in `CARRY` late in each hold when the previous
-contract has expired — that is the accepted −1 trade-off, not a bug.
-
-## 9. Adjusted prices (parquet)
-
-```python
-from sysdata.data_blob import dataBlob
-from sysproduction.data.prices import diagPrices
-adjusted = diagPrices(dataBlob()).get_adjusted_prices("SHFE_RB")
-print(adjusted.index[0], "->", adjusted.index[-1], len(adjusted), "rows")
-```
-
-Panama-stitched; long histories can go negative — expected, not a defect.
-Truncated-on-purpose series: renamed predecessors (CZCE_ER/ME/RO/WS/WT/TC)
-end at their rename; dead markets (CZCE_JR/LR/PM/RI/RS/WH/ZC, DCE_BB,
-SHFE_WR) end when liquidity died. Every active instrument should reach the
-last trading day; the sweep below verifies that.
-
-```python
-# truncation sweep: adjusted series ending long before its contract data
-from sysdata.data_blob import dataBlob
-from sysproduction.data.prices import diagPrices
-prices = diagPrices(dataBlob())
-for code in sorted(prices.db_futures_adjusted_prices_data.get_list_of_instruments()):
-    adjusted = prices.db_futures_adjusted_prices_data.get_adjusted_prices(code)
-    contracts = prices.db_futures_contract_price_data.get_merged_prices_for_instrument(code)
-    last = max(p.index.max() for p in contracts.values() if len(p))
-    if (last - adjusted.index[-1]).days > 30:
-        print(code, "ends", adjusted.index[-1].date(), "vs contract data", last.date())
-```
-
-## 10. Production continuation and live rolls
-
-After collecting new concrete-contract prices, the native daily update
-extends multiple and adjusted prices:
-
-```bash
-uv run python -m sysproduction.update_tushare_futures
-uv run python -m sysproduction.run_daily_update_multiple_adjusted_prices
-```
-
-The updater continues from the current/forward/carry identities in the final
-multiple-price row. It does not replay or extend the historical calendar CSV.
-Inspect that live state directly:
-
-```python
-from sysdata.data_blob import dataBlob
-from sysproduction.data.prices import diagPrices
-print(diagPrices(dataBlob()).get_multiple_prices("SHFE_RB").tail(1).T)
-```
-
-When a contract actually rolls, use the native interactive workflow:
-
-```bash
-uv run python -m sysproduction.interactive_update_roll_status
-```
-
-It uses current multiple-price identities, actual expiry/contract state, roll
-parameters, and positions. It updates multiple and adjusted prices, not the
-calendar CSV.
-
-## 11. Simulation view (what a backtest sees)
-
-```python
-from sysdata.sim.db_futures_sim_data import dbFuturesSimData
-data = dbFuturesSimData()
-print(len(data.get_instrument_list()), "instruments")
-print(data.get_backadjusted_futures_price("SHFE_RB").tail())
-print(data.get_multiple_prices("SHFE_RB").tail())
-print(data.get_fx_for_instrument("SHFE_RB", "USD").tail())   # via CNHUSD
-print(data.get_spread_cost("SHFE_RB"))
-```
-
-## 12. Pipeline health in one shot
-
-```bash
-uv run python -m sysinit.futures.seed_price_data_from_tushare --dry-run   # catalogue + config validation
-uv run pytest sysdata/tests/test_tushare_futures_config.py -q             # config invariants
-PYSYSTEMTRADE_RUN_MONGO_TESTS=1 uv run pytest -q                          # full suite incl. storage workflows
-```
-
-A seed re-run is also a full store audit: it validates every stored
-checkpoint (columns, 23:00 stamps, monotonicity, era window) and reports
-`skipped_complete` for healthy contracts without re-downloading anything.
+“缺失 N 行”只统计特定输入没有报价的观察行数。它不等于日历天数，也不证明存在可补取的成交。缺失原因和可计算时段需要单列。

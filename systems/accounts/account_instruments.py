@@ -112,7 +112,9 @@ class accountInstruments(accountCosts, accountBufferingSystemLevel):
 
         return instrument_pandl
 
-    @diagnostic(not_pickable=True)
+    # Positions are Series: their abbreviated string is not a unique cache key.
+    # Fixed-capital and compounded positions can differ only in the hidden rows.
+    @dont_cache
     def _pandl_for_instrument_with_SR_costs(
         self,
         instrument_code: str,
@@ -174,7 +176,8 @@ class accountInstruments(accountCosts, accountBufferingSystemLevel):
         ## Turnover will be at portfolio level, so a small number, but meaningful when added up
         return turnover(positions, average_position_for_turnover)
 
-    @diagnostic(not_pickable=True)
+    # Cache the caller's named account, not a curve keyed by a Series repr.
+    @dont_cache
     def _pandl_for_instrument_with_cash_costs(
         self,
         instrument_code: str,

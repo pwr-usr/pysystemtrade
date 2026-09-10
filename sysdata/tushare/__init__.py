@@ -1,10 +1,21 @@
 """Read-only Tushare historical futures data source for Chinese exchanges."""
 
 from sysdata.tushare.client import TushareClient
-from sysdata.tushare.source import HistoricalFuturesContract, TushareFuturesPriceSource
+from sysdata.tushare.source import (
+    HistoricalFuturesContract,
+    TushareFuturesPriceSource,
+    tushareConnection,
+    tushareFuturesContractData,
+    tushareFuturesContractPriceData,
+    tushareFxPricesData,
+)
 
 __all__ = [
     "TushareClient",
     "TushareFuturesPriceSource",
     "HistoricalFuturesContract",
+    "tushareConnection",
+    "tushareFuturesContractData",
+    "tushareFuturesContractPriceData",
+    "tushareFxPricesData",
 ]

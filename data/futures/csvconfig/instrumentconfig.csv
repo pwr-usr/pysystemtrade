@@ -585,102 +585,102 @@ YENEUR,YENEUR currency,125000,JPY,FX,329.4,0,0,US
 YENEUR-ICE,EUR.JPY,125000,JPY,FX,0,0,0,US
 ZAR,South African Rand,500000,USD,FX,2.47,0,0,US
 ZINC_LME,Zinc - LME,25,USD,Metals,0,0,0,EMEA
-CFFEX_IC,China CSI 500 equity index,200,CNH,Equity,0,0,0,ASIA
-CFFEX_IF,China CSI 300 equity index,300,CNH,Equity,0,0,0,ASIA
-CFFEX_IH,China SSE 50 equity index,300,CNH,Equity,0,0,0,ASIA
-CFFEX_IM,China CSI 1000 equity index,200,CNH,Equity,0,0,0,ASIA
-CFFEX_T,China 10-year government bond,10000,CNH,Bond,0,0,0,ASIA
-CFFEX_TF,China 5-year government bond,10000,CNH,Bond,0,0,0,ASIA
-CFFEX_TL,China 30-year government bond,10000,CNH,Bond,0,0,0,ASIA
-CFFEX_TS,China 2-year government bond,20000,CNH,Bond,0,0,0,ASIA
-CZCE_AP,Zhengzhou apple,10,CNH,Ags,0,0,0,ASIA
-CZCE_CF,Zhengzhou cotton,5,CNH,Ags,0,0,0,ASIA
-CZCE_CJ,Zhengzhou red dates,5,CNH,Ags,0,0,0,ASIA
-CZCE_CY,Zhengzhou cotton yarn,5,CNH,Ags,0,0,0,ASIA
-CZCE_ER,Zhengzhou early indica rice legacy contract,10,CNH,Ags,0,0,0,ASIA
-CZCE_FG,Zhengzhou flat glass,20,CNH,Other,0,0,0,ASIA
-CZCE_JR,Zhengzhou japonica rice,20,CNH,Ags,0,0,0,ASIA
-CZCE_LR,Zhengzhou late indica rice,20,CNH,Ags,0,0,0,ASIA
-CZCE_MA,Zhengzhou methanol,10,CNH,Other,0,0,0,ASIA
-CZCE_ME,Zhengzhou methanol legacy contract,50,CNH,Other,0,0,0,ASIA
-CZCE_OI,Zhengzhou rapeseed oil,10,CNH,Ags,0,0,0,ASIA
-CZCE_PF,Zhengzhou polyester staple fibre,5,CNH,Other,0,0,0,ASIA
-CZCE_PK,Zhengzhou peanut kernel,5,CNH,Ags,0,0,0,ASIA
-CZCE_PL,Zhengzhou propylene,20,CNH,Other,0,0,0,ASIA
-CZCE_PM,Zhengzhou common wheat,50,CNH,Ags,0,0,0,ASIA
-CZCE_PR,Zhengzhou bottle-grade PET resin,15,CNH,Other,0,0,0,ASIA
-CZCE_PX,Zhengzhou para-xylene,5,CNH,Other,0,0,0,ASIA
-CZCE_RI,Zhengzhou early indica rice,20,CNH,Ags,0,0,0,ASIA
-CZCE_RM,Zhengzhou rapeseed meal,10,CNH,Ags,0,0,0,ASIA
-CZCE_RO,Zhengzhou rapeseed oil legacy contract,5,CNH,Ags,0,0,0,ASIA
-CZCE_RS,Zhengzhou rapeseed,10,CNH,Ags,0,0,0,ASIA
-CZCE_SA,Zhengzhou soda ash,20,CNH,Other,0,0,0,ASIA
-CZCE_SF,Zhengzhou ferrosilicon,5,CNH,Metals,0,0,0,ASIA
-CZCE_SH,Zhengzhou caustic soda,30,CNH,Other,0,0,0,ASIA
-CZCE_SM,Zhengzhou silicomanganese,5,CNH,Metals,0,0,0,ASIA
-CZCE_SR,Zhengzhou white sugar,10,CNH,Ags,0,0,0,ASIA
-CZCE_TA,Zhengzhou purified terephthalic acid,5,CNH,Other,0,0,0,ASIA
-CZCE_TC,Zhengzhou thermal coal legacy contract,200,CNH,OilGas,0,0,0,ASIA
-CZCE_UR,Zhengzhou urea,20,CNH,Other,0,0,0,ASIA
-CZCE_WH,Zhengzhou strong gluten wheat,20,CNH,Ags,0,0,0,ASIA
-CZCE_WS,Zhengzhou strong gluten wheat legacy contract,10,CNH,Ags,0,0,0,ASIA
-CZCE_WT,Zhengzhou hard white wheat legacy contract,10,CNH,Ags,0,0,0,ASIA
-CZCE_ZC,Zhengzhou thermal coal,100,CNH,OilGas,0,0,0,ASIA
-DCE_A,Dalian No. 1 soybeans,10,CNH,Ags,0,0,0,ASIA
-DCE_B,Dalian No. 2 soybeans,10,CNH,Ags,0,0,0,ASIA
-DCE_BB,Dalian plywood,500,CNH,Ags,0,0,0,ASIA
-DCE_BZ,Dalian pure benzene,30,CNH,Other,0,0,0,ASIA
-DCE_C,Dalian corn,10,CNH,Ags,0,0,0,ASIA
-DCE_CS,Dalian corn starch,10,CNH,Ags,0,0,0,ASIA
-DCE_EB,Dalian styrene,5,CNH,Other,0,0,0,ASIA
-DCE_EG,Dalian ethylene glycol,10,CNH,Other,0,0,0,ASIA
-DCE_FB_OLD,Dalian fibreboard legacy 500-sheet contract,500,CNH,Ags,0,0,0,ASIA
-DCE_FB,Dalian fibreboard,10,CNH,Ags,0,0,0,ASIA
-DCE_I,Dalian iron ore,100,CNH,Metals,0,0,0,ASIA
-DCE_J,Dalian coke,100,CNH,OilGas,0,0,0,ASIA
-DCE_JD,Dalian eggs,10,CNH,Ags,0,0,0,ASIA
-DCE_JM,Dalian coking coal,60,CNH,OilGas,0,0,0,ASIA
-DCE_L,Dalian linear low-density polyethylene,5,CNH,Other,0,0,0,ASIA
-DCE_LG,Dalian logs,90,CNH,Ags,0,0,0,ASIA
-DCE_LH,Dalian live hogs,16,CNH,Ags,0,0,0,ASIA
-DCE_L_F,Dalian linear low-density polyethylene monthly average,5,CNH,Other,0,0,0,ASIA
-DCE_M,Dalian soybean meal,10,CNH,Ags,0,0,0,ASIA
-DCE_P,Dalian refined palm olein,10,CNH,Ags,0,0,0,ASIA
-DCE_PG,Dalian liquefied petroleum gas,20,CNH,OilGas,0,0,0,ASIA
-DCE_PP,Dalian polypropylene,5,CNH,Other,0,0,0,ASIA
-DCE_PP_F,Dalian polypropylene monthly average,5,CNH,Other,0,0,0,ASIA
-DCE_RR,Dalian japonica rice,10,CNH,Ags,0,0,0,ASIA
-DCE_V,Dalian polyvinyl chloride,5,CNH,Other,0,0,0,ASIA
-DCE_V_F,Dalian polyvinyl chloride monthly average,5,CNH,Other,0,0,0,ASIA
-DCE_Y,Dalian soybean oil,10,CNH,Ags,0,0,0,ASIA
-GFEX_LC,Guangzhou lithium carbonate,1,CNH,Metals,0,0,0,ASIA
-GFEX_PD,Guangzhou palladium,1000,CNH,Metals,0,0,0,ASIA
-GFEX_PS,Guangzhou polysilicon,3,CNH,Metals,0,0,0,ASIA
-GFEX_PT,Guangzhou platinum,1000,CNH,Metals,0,0,0,ASIA
-GFEX_SI,Guangzhou industrial silicon,5,CNH,Metals,0,0,0,ASIA
-INE_BC,Shanghai International Energy Center bonded copper,5,CNH,Metals,0,0,0,ASIA
-INE_EC,Shanghai International Energy Center container freight index Europe,50,CNH,Other,0,0,0,ASIA
-INE_LU,Shanghai International Energy Center low-sulfur fuel oil,10,CNH,OilGas,0,0,0,ASIA
-INE_NR,Shanghai International Energy Center TSR 20 rubber,10,CNH,Other,0,0,0,ASIA
-INE_SC,Shanghai International Energy Center crude oil,1000,CNH,OilGas,0,0,0,ASIA
-INE_SCTAS,Shanghai International Energy Center crude oil trade-at-settlement,1000,CNH,OilGas,0,0,0,ASIA
-SHFE_AD,Shanghai cast aluminium alloy,10,CNH,Metals,0,0,0,ASIA
-SHFE_AG,Shanghai silver,15,CNH,Metals,0,0,0,ASIA
-SHFE_AL,Shanghai aluminium,5,CNH,Metals,0,0,0,ASIA
-SHFE_AO,Shanghai alumina,20,CNH,Metals,0,0,0,ASIA
-SHFE_AU,Shanghai gold,1000,CNH,Metals,0,0,0,ASIA
-SHFE_BR,Shanghai butadiene rubber,5,CNH,Other,0,0,0,ASIA
-SHFE_BU,Shanghai bitumen,10,CNH,OilGas,0,0,0,ASIA
-SHFE_CU,Shanghai copper,5,CNH,Metals,0,0,0,ASIA
-SHFE_FU,Shanghai fuel oil,10,CNH,OilGas,0,0,0,ASIA
-SHFE_HC,Shanghai hot-rolled coil,10,CNH,Metals,0,0,0,ASIA
-SHFE_NI,Shanghai nickel,1,CNH,Metals,0,0,0,ASIA
-SHFE_OP,Shanghai offset printing paper,40,CNH,Other,0,0,0,ASIA
-SHFE_PB,Shanghai lead,5,CNH,Metals,0,0,0,ASIA
-SHFE_RB,Shanghai steel rebar,10,CNH,Metals,0,0,0,ASIA
-SHFE_RU,Shanghai natural rubber,10,CNH,Other,0,0,0,ASIA
-SHFE_SN,Shanghai tin,1,CNH,Metals,0,0,0,ASIA
-SHFE_SP,Shanghai wood pulp,10,CNH,Other,0,0,0,ASIA
-SHFE_SS,Shanghai stainless steel,5,CNH,Metals,0,0,0,ASIA
-SHFE_WR,Shanghai steel wire rod,10,CNH,Metals,0,0,0,ASIA
-SHFE_ZN,Shanghai zinc,5,CNH,Metals,0,0,0,ASIA
+CFFEX_IC,中金所中证五百股指,200,CNH,Equity,0,0,0,ASIA
+CFFEX_IF,中金所沪深三百股指,300,CNH,Equity,0,0,0,ASIA
+CFFEX_IH,中金所上证五十股指,300,CNH,Equity,0,0,0,ASIA
+CFFEX_IM,中金所中证一千股指,200,CNH,Equity,0,0,0,ASIA
+CFFEX_T,中金所十年期国债,10000,CNH,Bond,0,0,0,ASIA
+CFFEX_TF,中金所五年期国债,10000,CNH,Bond,0,0,0,ASIA
+CFFEX_TL,中金所三十年期国债,10000,CNH,Bond,0,0,0,ASIA
+CFFEX_TS,中金所两年期国债,20000,CNH,Bond,0,0,0,ASIA
+CZCE_AP,郑商所苹果,10,CNH,Ags,0,0,0,ASIA
+CZCE_CF,郑商所棉花,5,CNH,Ags,0,0,0,ASIA
+CZCE_CJ,郑商所红枣,5,CNH,Ags,0,0,0,ASIA
+CZCE_CY,郑商所棉纱,5,CNH,Ags,0,0,0,ASIA
+CZCE_ER,郑商所早籼稻（旧合约）,10,CNH,Ags,0,0,0,ASIA
+CZCE_FG,郑商所玻璃,20,CNH,Other,0,0,0,ASIA
+CZCE_JR,郑商所粳稻,20,CNH,Ags,0,0,0,ASIA
+CZCE_LR,郑商所晚籼稻,20,CNH,Ags,0,0,0,ASIA
+CZCE_MA,郑商所甲醇,10,CNH,Other,0,0,0,ASIA
+CZCE_ME,郑商所甲醇（旧合约）,50,CNH,Other,0,0,0,ASIA
+CZCE_OI,郑商所菜籽油,10,CNH,Ags,0,0,0,ASIA
+CZCE_PF,郑商所短纤,5,CNH,Other,0,0,0,ASIA
+CZCE_PK,郑商所花生,5,CNH,Ags,0,0,0,ASIA
+CZCE_PL,郑商所丙烯,20,CNH,Other,0,0,0,ASIA
+CZCE_PM,郑商所普通小麦,50,CNH,Ags,0,0,0,ASIA
+CZCE_PR,郑商所瓶片,15,CNH,Other,0,0,0,ASIA
+CZCE_PX,郑商所对二甲苯,5,CNH,Other,0,0,0,ASIA
+CZCE_RI,郑商所早籼稻,20,CNH,Ags,0,0,0,ASIA
+CZCE_RM,郑商所菜籽粕,10,CNH,Ags,0,0,0,ASIA
+CZCE_RO,郑商所菜籽油（旧合约）,5,CNH,Ags,0,0,0,ASIA
+CZCE_RS,郑商所油菜籽,10,CNH,Ags,0,0,0,ASIA
+CZCE_SA,郑商所纯碱,20,CNH,Other,0,0,0,ASIA
+CZCE_SF,郑商所硅铁,5,CNH,Metals,0,0,0,ASIA
+CZCE_SH,郑商所烧碱,30,CNH,Other,0,0,0,ASIA
+CZCE_SM,郑商所锰硅,5,CNH,Metals,0,0,0,ASIA
+CZCE_SR,郑商所白糖,10,CNH,Ags,0,0,0,ASIA
+CZCE_TA,郑商所精对苯二甲酸,5,CNH,Other,0,0,0,ASIA
+CZCE_TC,郑商所动力煤（旧合约）,200,CNH,OilGas,0,0,0,ASIA
+CZCE_UR,郑商所尿素,20,CNH,Other,0,0,0,ASIA
+CZCE_WH,郑商所强筋小麦,20,CNH,Ags,0,0,0,ASIA
+CZCE_WS,郑商所强筋小麦（旧合约）,10,CNH,Ags,0,0,0,ASIA
+CZCE_WT,郑商所硬白小麦（旧合约）,10,CNH,Ags,0,0,0,ASIA
+CZCE_ZC,郑商所动力煤,100,CNH,OilGas,0,0,0,ASIA
+DCE_A,大商所黄大豆一号,10,CNH,Ags,0,0,0,ASIA
+DCE_B,大商所黄大豆二号,10,CNH,Ags,0,0,0,ASIA
+DCE_BB,大商所胶合板,500,CNH,Ags,0,0,0,ASIA
+DCE_BZ,大商所纯苯,30,CNH,Other,0,0,0,ASIA
+DCE_C,大商所玉米,10,CNH,Ags,0,0,0,ASIA
+DCE_CS,大商所玉米淀粉,10,CNH,Ags,0,0,0,ASIA
+DCE_EB,大商所苯乙烯,5,CNH,Other,0,0,0,ASIA
+DCE_EG,大商所乙二醇,10,CNH,Other,0,0,0,ASIA
+DCE_FB_OLD,大商所纤维板（旧五百张合约）,500,CNH,Ags,0,0,0,ASIA
+DCE_FB,大商所纤维板,10,CNH,Ags,0,0,0,ASIA
+DCE_I,大商所铁矿石,100,CNH,Metals,0,0,0,ASIA
+DCE_J,大商所焦炭,100,CNH,OilGas,0,0,0,ASIA
+DCE_JD,大商所鸡蛋,10,CNH,Ags,0,0,0,ASIA
+DCE_JM,大商所焦煤,60,CNH,OilGas,0,0,0,ASIA
+DCE_L,大商所线型低密度聚乙烯,5,CNH,Other,0,0,0,ASIA
+DCE_LG,大商所原木,90,CNH,Ags,0,0,0,ASIA
+DCE_LH,大商所生猪,16,CNH,Ags,0,0,0,ASIA
+DCE_L_F,大商所线型低密度聚乙烯月均价,5,CNH,Other,0,0,0,ASIA
+DCE_M,大商所豆粕,10,CNH,Ags,0,0,0,ASIA
+DCE_P,大商所棕榈油,10,CNH,Ags,0,0,0,ASIA
+DCE_PG,大商所液化石油气,20,CNH,OilGas,0,0,0,ASIA
+DCE_PP,大商所聚丙烯,5,CNH,Other,0,0,0,ASIA
+DCE_PP_F,大商所聚丙烯月均价,5,CNH,Other,0,0,0,ASIA
+DCE_RR,大商所粳米,10,CNH,Ags,0,0,0,ASIA
+DCE_V,大商所聚氯乙烯,5,CNH,Other,0,0,0,ASIA
+DCE_V_F,大商所聚氯乙烯月均价,5,CNH,Other,0,0,0,ASIA
+DCE_Y,大商所豆油,10,CNH,Ags,0,0,0,ASIA
+GFEX_LC,广期所碳酸锂,1,CNH,Metals,0,0,0,ASIA
+GFEX_PD,广期所钯,1000,CNH,Metals,0,0,0,ASIA
+GFEX_PS,广期所多晶硅,3,CNH,Metals,0,0,0,ASIA
+GFEX_PT,广期所铂,1000,CNH,Metals,0,0,0,ASIA
+GFEX_SI,广期所工业硅,5,CNH,Metals,0,0,0,ASIA
+INE_BC,上海能源国际铜,5,CNH,Metals,0,0,0,ASIA
+INE_EC,上海能源集运指数（欧线）,50,CNH,Other,0,0,0,ASIA
+INE_LU,上海能源低硫燃料油,10,CNH,OilGas,0,0,0,ASIA
+INE_NR,上海能源二十号胶,10,CNH,Other,0,0,0,ASIA
+INE_SC,上海能源原油,1000,CNH,OilGas,0,0,0,ASIA
+INE_SCTAS,上海能源原油结算价交易,1000,CNH,OilGas,0,0,0,ASIA
+SHFE_AD,上期所铸造铝合金,10,CNH,Metals,0,0,0,ASIA
+SHFE_AG,上期所白银,15,CNH,Metals,0,0,0,ASIA
+SHFE_AL,上期所铝,5,CNH,Metals,0,0,0,ASIA
+SHFE_AO,上期所氧化铝,20,CNH,Metals,0,0,0,ASIA
+SHFE_AU,上期所黄金,1000,CNH,Metals,0,0,0,ASIA
+SHFE_BR,上期所丁二烯橡胶,5,CNH,Other,0,0,0,ASIA
+SHFE_BU,上期所石油沥青,10,CNH,OilGas,0,0,0,ASIA
+SHFE_CU,上期所铜,5,CNH,Metals,0,0,0,ASIA
+SHFE_FU,上期所燃料油,10,CNH,OilGas,0,0,0,ASIA
+SHFE_HC,上期所热轧卷板,10,CNH,Metals,0,0,0,ASIA
+SHFE_NI,上期所镍,1,CNH,Metals,0,0,0,ASIA
+SHFE_OP,上期所胶版印刷纸,40,CNH,Other,0,0,0,ASIA
+SHFE_PB,上期所铅,5,CNH,Metals,0,0,0,ASIA
+SHFE_RB,上期所螺纹钢,10,CNH,Metals,0,0,0,ASIA
+SHFE_RU,上期所天然橡胶,10,CNH,Other,0,0,0,ASIA
+SHFE_SN,上期所锡,1,CNH,Metals,0,0,0,ASIA
+SHFE_SP,上期所纸浆,10,CNH,Other,0,0,0,ASIA
+SHFE_SS,上期所不锈钢,5,CNH,Metals,0,0,0,ASIA
+SHFE_WR,上期所线材,10,CNH,Metals,0,0,0,ASIA
+SHFE_ZN,上期所锌,5,CNH,Metals,0,0,0,ASIA

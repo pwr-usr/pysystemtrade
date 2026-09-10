@@ -1,15 +1,6 @@
-"""Behavioural tests for the Tushare seed/update workflows.
-
-Storage-touching tests run end-to-end against a throwaway Mongo database and
-a temporary parquet store (set ``PYSYSTEMTRADE_RUN_MONGO_TESTS=1``); only the
-vendor source is faked.  Pure helpers are tested unconditionally.
-"""
-
-from __future__ import annotations
+"""Unified updater behaviour using native temporary Parquet and an in-memory catalogue."""
 
 import datetime
-import os
-import uuid
 from types import SimpleNamespace
 
 import pandas as pd
@@ -17,391 +8,345 @@ import pytest
 
 from syscore.dateutils import DAILY_PRICE_FREQ
 from sysdata.data_blob import dataBlob
-from sysdata.mongodb.mongo_connection import mongoDb
-from sysdata.tushare.errors import TushareDataError, TushareTransientError
+from sysdata.tushare.errors import TushareTransientError
 from sysdata.tushare.source import HistoricalFuturesContract
 from sysobjects.futures_per_contract_prices import futuresContractPrices
-from sysobjects.spot_fx_prices import fxPrices
-from sysproduction.data.contracts import dataContracts
 from sysproduction.data.prices import diagPrices
-import sysproduction.update_tushare_futures as tushare_workflows
-from sysproduction.update_tushare_futures import (
-    _raise_if_fatal_tushare_error,
-    historical_price_correction_dates,
-    safe_tushare_error_text,
-    seed_tushare_futures,
-    update_tushare_cnhusd,
-    update_tushare_futures,
-)
-
-RUN_MONGO_TESTS = os.environ.get("PYSYSTEMTRADE_RUN_MONGO_TESTS") == "1"
-mongo_gated = pytest.mark.skipif(
-    not RUN_MONGO_TESTS,
-    reason="set PYSYSTEMTRADE_RUN_MONGO_TESTS=1 for the local Mongo workflow tests",
-)
-
-AS_OF = datetime.date(2024, 6, 3)
+import sysproduction.update_tushare_futures as workflow
 
 
-# ---------------------------------------------------------------------------
-# pure helpers (always run)
-# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def no_mongo_connections(monkeypatch):
+    def fail(*args, **kwargs):
+        pytest.fail("Workflow tests must use in-memory contract metadata")
+
+    monkeypatch.setattr(dataBlob, "_add_mongo_class", fail)
 
 
-def test_error_text_redacts_the_active_token(monkeypatch):
-    monkeypatch.setenv("TUSHARE_TOKEN", "super-secret-token")
-    text = safe_tushare_error_text(RuntimeError("failed with super-secret-token"))
-    assert "super-secret-token" not in text
-    assert "<redacted>" in text
-
-
-def test_correction_dates_detects_changed_added_and_removed_history():
-    old = _prices({"2024-05-28": 100.0, "2024-05-29": 101.0, "2024-05-30": 102.0})
-    unchanged = _prices({"2024-05-28": 100.0, "2024-05-29": 101.0, "2024-05-30": 102.0})
-    assert historical_price_correction_dates(old, unchanged) == []
-
-    changed = _prices({"2024-05-28": 100.0, "2024-05-29": 999.0, "2024-05-30": 102.0})
-    assert historical_price_correction_dates(old, changed) == [
-        datetime.date(2024, 5, 29)
-    ]
-
-    added = _prices(
-        {
-            "2024-05-27": 99.0,
-            "2024-05-28": 100.0,
-            "2024-05-29": 101.0,
-            "2024-05-30": 102.0,
-        }
+def prices(values):
+    frame = pd.DataFrame(
+        {name: list(values.values()) for name in ["OPEN", "HIGH", "LOW", "FINAL"]},
+        index=pd.to_datetime(list(values)) + pd.Timedelta(hours=23),
     )
-    assert historical_price_correction_dates(old, added) == [datetime.date(2024, 5, 27)]
-
-    removed = _prices({"2024-05-28": 100.0, "2024-05-30": 102.0})
-    assert historical_price_correction_dates(
-        old, removed, comparison_start=datetime.date(2024, 5, 28)
-    ) == [datetime.date(2024, 5, 29)]
+    frame["VOLUME"] = 1000.0
+    return futuresContractPrices(frame)
 
 
-def test_correction_dates_ignores_genuinely_new_rows():
-    old = _prices({"2024-05-28": 100.0, "2024-05-29": 101.0})
-    extended = _prices({"2024-05-28": 100.0, "2024-05-29": 101.0, "2024-05-30": 102.0})
-    assert historical_price_correction_dates(old, extended) == []
-
-
-def test_unknown_workflow_errors_are_critically_logged_and_raised():
-    critical_messages = []
-    log = SimpleNamespace(critical=critical_messages.append)
-    error = RuntimeError("unexpected programming failure")
-
-    with pytest.raises(RuntimeError, match="unexpected programming failure"):
-        _raise_if_fatal_tushare_error(error, log)
-
-    assert len(critical_messages) == 1
-    assert "fatal error" in critical_messages[0]
-
-
-def test_cnhusd_update_rejects_mutated_overlap(monkeypatch):
-    index = pd.to_datetime(["2024-05-29 23:00", "2024-05-30 23:00"])
-    existing = fxPrices(pd.Series([0.138, 0.139], index=index))
-    downloaded = fxPrices(pd.Series([0.138, 0.999], index=index))
-
-    class FakeCurrencyData:
-        def get_fx_prices(self, code):
-            assert code == "CNHUSD"
-            return existing
-
-        def update_fx_prices_and_return_rows_added(self, *args, **kwargs):
-            raise AssertionError("mutated CNHUSD history must not be written")
-
-    monkeypatch.setattr(
-        tushare_workflows, "dataCurrency", lambda data: FakeCurrencyData()
-    )
-    source = SimpleNamespace(
-        get_cnhusd_prices=lambda **kwargs: downloaded,
-    )
-
-    with pytest.raises(RuntimeError, match="changed stored CNHUSD history"):
-        update_tushare_cnhusd(
-            data=object(),
-            source=source,
-            as_of=datetime.date(2024, 5, 30),
-            overlap_days=7,
-        )
-
-
-# ---------------------------------------------------------------------------
-# end-to-end workflows (mongo-gated)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def blob(tmp_path):
-    database_name = "pysystemtrade_tushare_test_" + uuid.uuid4().hex
-    mongo = mongoDb(
-        mongo_db=database_name,
-        mongo_host=os.environ.get("PYSYSTEMTRADE_TUSHARE_MONGO_HOST", "127.0.0.1"),
-        mongo_port=int(os.environ.get("PYSYSTEMTRADE_TUSHARE_MONGO_PORT", "27017")),
-    )
-    data = dataBlob(
-        log_name="tushare_workflow_test",
-        parquet_store_path=str(tmp_path / "parquet"),
-        mongo_db=mongo,
-    )
-    yield data
-    mongo.client.drop_database(database_name)
-
-
-@mongo_gated
-def test_seed_writes_day_and_merged_prices_and_contract_state(blob):
-    records, source = _cu_fixture()
-    result = seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-
-    assert result.okay
-    assert result.contracts_written == 2
-    assert result.contracts_not_yet_listed == 1
-
-    price_store = diagPrices(blob).db_futures_contract_price_data
-    expired_contract = records[0].as_futures_contract()
-    daily = price_store.get_prices_at_frequency_for_contract_object(
-        expired_contract, frequency=DAILY_PRICE_FREQ
-    )
-    merged = price_store.get_merged_prices_for_contract_object(expired_contract)
-    assert pd.DataFrame(daily).equals(pd.DataFrame(merged))
-    assert daily.index[0] == pd.Timestamp("2024-01-02 23:00:00")
-
-    contracts = dataContracts(blob)
-    stored = {
-        contract.date_str: contract
-        for contract in contracts.get_all_contract_objects_for_instrument_code(
-            "SHFE_CU"
-        )
-    }
-    assert not stored["20240100"].currently_sampling
-    assert stored["20240800"].currently_sampling
-
-
-@mongo_gated
-def test_seed_resume_refreshes_active_and_repairs_finalized_checkpoints(blob):
-    records, source = _cu_fixture()
-    seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-    calls_after_seed = source.calls
-
-    rerun = seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-    assert rerun.okay
-    assert rerun.contracts_skipped_complete == 1
-    assert rerun.contracts_written == 1
-    assert source.calls == calls_after_seed + 1  # active contract was refreshed
-
-    # delete the merged file: resume must repair it from the daily series
-    price_store = diagPrices(blob).db_futures_contract_price_data
-    expired_contract = records[0].as_futures_contract()
-    price_store._delete_merged_prices_for_contract_object_with_no_checks_be_careful(
-        expired_contract
-    )
-    repair = seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-    assert repair.contracts_repaired == 1
-    assert repair.contracts_written == 1
-    assert source.calls == calls_after_seed + 2
-    merged = price_store.get_merged_prices_for_contract_object(expired_contract)
-    assert len(merged) == 2
-
-
-@mongo_gated
-def test_seed_no_resume_overwrites_checkpoints(blob):
-    records, source = _cu_fixture()
-    seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-    rerun = seed_tushare_futures(
-        data=blob,
-        source=source,
-        records=records,
-        resume=False,
-        as_of=AS_OF,
-        update_fx=False,
-    )
-    assert rerun.okay
-    assert rerun.contracts_written == 2
-    assert rerun.contracts_skipped_complete == 0
-
-
-@mongo_gated
-def test_update_appends_new_rows_and_is_idempotent(blob):
-    records, source = _cu_fixture()
-    seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-
-    source.extend("CU2408.SHF", {"2024-06-04": 103.0})
-    next_day = datetime.date(2024, 6, 4)
-    result = update_tushare_futures(
-        data=blob, source=source, records=records, as_of=next_day, update_fx=False
-    )
-    assert result.okay
-    assert result.rows_written == 1
-    assert result.contracts_written == 1  # only the active contract is sampling
-
-    price_store = diagPrices(blob).db_futures_contract_price_data
-    active_contract = records[1].as_futures_contract()
-    daily = price_store.get_prices_at_frequency_for_contract_object(
-        active_contract, frequency=DAILY_PRICE_FREQ
-    )
-    merged = price_store.get_merged_prices_for_contract_object(active_contract)
-    assert daily.index[-1] == pd.Timestamp("2024-06-04 23:00:00")
-    assert pd.DataFrame(daily).equals(pd.DataFrame(merged))
-
-    again = update_tushare_futures(
-        data=blob, source=source, records=records, as_of=next_day, update_fx=False
-    )
-    assert again.okay
-    assert again.rows_written == 0
-
-
-@mongo_gated
-def test_update_refuses_silently_mutated_history(blob):
-    records, source = _cu_fixture()
-    seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-
-    source.mutate("CU2408.SHF", "2024-05-30", 999.0)
-    result = update_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-    assert not result.okay
-    assert len(result.failures) == 1
-    assert "changed stored history" in result.failures[0].reason
-
-    # stored prices must be untouched
-    price_store = diagPrices(blob).db_futures_contract_price_data
-    active_contract = records[1].as_futures_contract()
-    daily = price_store.get_prices_at_frequency_for_contract_object(
-        active_contract, frequency=DAILY_PRICE_FREQ
-    )
-    assert daily["FINAL"].iloc[-1] == 102.0
-
-
-@mongo_gated
-def test_transient_source_failure_is_contract_level_but_data_error_is_fatal(blob):
-    records, source = _cu_fixture()
-
-    source.fail_with = TushareTransientError("provider flaked")
-    result = seed_tushare_futures(
-        data=blob, source=source, records=records, as_of=AS_OF, update_fx=False
-    )
-    assert not result.okay
-    assert len(result.failures) == 2  # both fetchable contracts failed, run completed
-
-    source.fail_with = TushareDataError("schema drift")
-    with pytest.raises(TushareDataError):
-        seed_tushare_futures(
-            data=blob,
-            source=source,
-            records=records,
-            resume=False,
-            as_of=AS_OF,
-            update_fx=False,
-        )
-
-    source.fail_with = RuntimeError("unexpected programming failure")
-    with pytest.raises(RuntimeError, match="unexpected programming failure"):
-        seed_tushare_futures(
-            data=blob,
-            source=source,
-            records=records,
-            resume=False,
-            as_of=AS_OF,
-            update_fx=False,
-        )
-
-
-# ---------------------------------------------------------------------------
-# fixtures
-# ---------------------------------------------------------------------------
-
-
-def _cu_fixture():
-    """Three SHFE copper contracts: expired, active, and not yet listed."""
-
-    expired = _record("20240100", "CU2401.SHF", "2023-01-03", "2024-01-15")
-    active = _record("20240800", "CU2408.SHF", "2023-08-01", "2024-08-15")
-    unlisted = _record("20250100", "CU2501.SHF", "2024-07-01", "2025-01-15")
-    source = _FakeSource(
-        {
-            "CU2401.SHF": {"2024-01-02": 68000.0, "2024-01-03": 68100.0},
-            "CU2408.SHF": {"2024-05-29": 100.0, "2024-05-30": 102.0},
-        }
-    )
-    return [expired, active, unlisted], source
-
-
-def _record(contract_date, external_code, first_trade, expiry):
+def record(month="20240800", expiry="2024-08-15"):
     return HistoricalFuturesContract(
-        instrument_code="SHFE_CU",
-        contract_date=contract_date,
-        external_contract_code=external_code,
-        exchange="SHFE",
-        product_code="CU",
-        first_trade_date=pd.Timestamp(first_trade).date(),
-        expiry_date=pd.Timestamp(expiry).date(),
+        "SHFE_CU",
+        month,
+        "CU" + month[2:6] + ".SHF",
+        "SHFE",
+        "CU",
+        datetime.date(2023, 8, 1),
+        pd.Timestamp(expiry).date(),
     )
 
 
-def _prices(finals: dict[str, float]) -> futuresContractPrices:
-    index = pd.to_datetime(list(finals.keys())) + pd.Timedelta(hours=23)
-    values = list(finals.values())
-    return futuresContractPrices(
-        pd.DataFrame(
+class Source:
+    def __init__(self):
+        self.values = {"2024-05-29": 100.0, "2024-05-30": 102.0}
+        self.calls = []
+        self.error = None
+        self.client = self
+
+    def fetch_contract_catalogue_result(self, refresh=False):
+        assert refresh
+        return SimpleNamespace(contracts=self.records, unmapped_families=())
+
+    def configured_instrument_codes(self):
+        return ["SHFE_CU"]
+
+    def get_record(self, contract):
+        return next(r for r in self.records if r.contract_date == contract.date_str)
+
+    def fut_daily(self, ts_code, start_date, end_date):
+        contract = next(r for r in self.records if r.external_contract_code == ts_code)
+        self.calls.append((contract.contract_date, start_date, end_date))
+        if self.error:
+            raise self.error
+        frame = prices(
             {
-                "OPEN": values,
-                "HIGH": values,
-                "LOW": values,
-                "FINAL": values,
-                "VOLUME": [1000.0] * len(values),
-            },
-            index=index,
+                k: v
+                for k, v in self.values.items()
+                if start_date <= pd.Timestamp(k).date() <= end_date
+            }
         )
+        frame = pd.DataFrame(frame).rename(
+            columns={
+                "OPEN": "open",
+                "HIGH": "high",
+                "LOW": "low",
+                "FINAL": "close",
+                "VOLUME": "vol",
+            }
+        )
+        frame["trade_date"] = frame.index.strftime("%Y%m%d")
+        frame["ts_code"] = ts_code
+        return frame.reset_index(drop=True)
+
+
+@pytest.fixture
+def setup(tmp_path, monkeypatch):
+    source = Source()
+    data = dataBlob(
+        log_name="test_tushare",
+        parquet_store_path=str(tmp_path / "parquet"),
+        tushare_connection=source,
+    )
+    contracts = {}
+    metadata = SimpleNamespace(
+        is_contract_in_data=lambda r: r.key in contracts,
+        get_contract_from_db=lambda r: contracts[r.key],
+        add_contract_data=lambda r, **kwargs: contracts.update({r.key: r}),
+    )
+    data.db_futures_contract = metadata
+    monkeypatch.setattr(workflow, "dataContracts", lambda data: metadata)
+    yield data, source, contracts
+    data.close()
+
+
+def run(setup, records=None, **kwargs):
+    data, source, _ = setup
+    source.records = records or [record()]
+    return workflow.update_tushare_futures(
+        data=data,
+        end_date=kwargs.pop("end_date", "2024-06-03"),
+        update_fx=False,
+        rebuild=False,
+        **kwargs,
     )
 
 
-class _FakeSource:
-    """Vendor stand-in: per-ts_code daily finals, window-sliced like Tushare."""
+def stored(setup, r=None):
+    return diagPrices(
+        setup[0]
+    ).db_futures_contract_price_data.get_prices_at_frequency_for_contract_object(
+        (r or record()).as_futures_contract(), frequency=DAILY_PRICE_FREQ
+    )
 
-    def __init__(self, finals_by_code: dict[str, dict[str, float]]):
-        self.finals_by_code = finals_by_code
-        self.calls = 0
-        self.fail_with: Exception | None = None
 
-    def extend(self, external_code: str, finals: dict[str, float]) -> None:
-        self.finals_by_code[external_code].update(finals)
+def test_empty_store_bootstrap_overlap_and_day_merged_equality(setup):
+    first = run(setup)
+    assert isinstance(
+        setup[0].tushare_futures_contract, workflow.tushareFuturesContractData
+    )
+    assert isinstance(
+        setup[0].tushare_futures_contract_price,
+        workflow.tushareFuturesContractPriceData,
+    )
+    assert first.loc["SHFE_CU", "rows_added"] == 2
+    setup[1].values["2024-06-04"] = 103.0
+    second = run(setup, end_date="2024-06-04")
+    assert second.loc["SHFE_CU", "rows_added"] == 1
+    assert setup[1].calls[-1][1] == datetime.date(2024, 5, 23)
+    store = diagPrices(setup[0]).db_futures_contract_price_data
+    merged = store.get_merged_prices_for_contract_object(record().as_futures_contract())
+    pd.testing.assert_frame_equal(pd.DataFrame(stored(setup)), pd.DataFrame(merged))
+    assert run(setup, end_date="2024-06-04").loc["SHFE_CU", "rows_added"] == 0
 
-    def mutate(self, external_code: str, day: str, value: float) -> None:
-        self.finals_by_code[external_code][day] = value
 
-    def get_prices_for_external_contract(
-        self, records, frequency, start_date=None, end_date=None
-    ):
-        self.calls += 1
-        if self.fail_with is not None:
-            raise self.fail_with
+def test_expired_gap_contract_is_fetched_and_only_verified_coverage_skips(setup):
+    expired = record(expiry="2024-05-31")
+    run(setup, records=[expired])
+    assert setup[1].calls[-1][1] == expired.first_trade_date
+    calls = len(setup[1].calls)
+    run(setup, records=[expired], end_date="2024-06-10")
+    assert len(setup[1].calls) == calls
+    receipt = {
+        "start": "2024-05-01",
+        "end": "2024-05-31",
+        "digest": workflow._price_digest(stored(setup, expired)),
+    }
+    first, last = workflow._request_window(
+        expired, stored(setup, expired), receipt, None, datetime.date(2024, 6, 10)
+    )
+    assert (
+        first == expired.first_trade_date
+    )  # a late receipt cannot certify the early history
+    assert last == expired.expiry_date
 
-        records = tuple(records)
-        external_code = records[0].external_contract_code
-        finals = self.finals_by_code.get(external_code, {})
-        result = {}
-        for record in records:
-            selected = {
-                day: value
-                for day, value in finals.items()
-                if (start_date is None or pd.Timestamp(day).date() >= start_date)
-                and (end_date is None or pd.Timestamp(day).date() <= end_date)
-            }
-            result[record] = _prices(selected)
-        return result
+
+def test_expired_during_update_gap_refreshes_metadata_and_missing_merged(setup):
+    expired = record(expiry="2024-05-31")
+    run(setup, records=[expired], end_date="2024-05-30")
+    assert setup[2][expired.as_futures_contract().key].currently_sampling
+    run(setup, records=[expired], end_date="2024-06-10")
+    assert not setup[2][expired.as_futures_contract().key].currently_sampling
+    store = diagPrices(setup[0]).db_futures_contract_price_data
+    store._delete_merged_prices_for_contract_object_with_no_checks_be_careful(
+        expired.as_futures_contract()
+    )
+    run(setup, records=[expired], end_date="2024-06-11")
+    assert (
+        len(store.get_merged_prices_for_contract_object(expired.as_futures_contract()))
+        == 2
+    )
+
+
+def test_dry_run_does_not_download_write_or_create_receipts(setup, tmp_path):
+    del setup[0].db_futures_contract
+    result = run(setup, dry_run=True)
+    assert result.loc["SHFE_CU", "status"] == "planned"
+    assert setup[1].calls == []
+    assert setup[2] == {}
+    assert not hasattr(setup[0], "db_futures_contract")
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not (tmp_path / "tushare_updates").exists()
+
+
+def test_revision_is_rejected_then_dated_repair_backs_up_and_accepts(setup, tmp_path):
+    run(setup)
+    setup[1].values["2024-05-30"] = 104.0
+    assert run(setup).loc["SHFE_CU", "status"] == "failed"
+    assert stored(setup).FINAL.iloc[-1] == 102.0
+    result = run(setup, start_date="2024-05-29")
+    assert result.loc["SHFE_CU", "status"] == "updated"
+    assert stored(setup).FINAL.iloc[-1] == 104.0
+    assert list(tmp_path.rglob("*_day_before.parquet"))
+    assert result.loc["SHFE_CU", "revisions"] == 4
+
+
+def test_empty_repair_response_preserves_existing_history(setup):
+    run(setup)
+    before = stored(setup).copy()
+    setup[1].values = {}
+    assert run(setup, start_date="2024-05-29").loc["SHFE_CU", "status"] == "failed"
+    pd.testing.assert_frame_equal(pd.DataFrame(stored(setup)), pd.DataFrame(before))
+
+
+def test_changed_stored_early_history_invalidates_active_receipt(setup):
+    run(setup)
+    old = stored(setup)
+    valid = dict(
+        start="2023-08-01", end="2024-06-03", digest=workflow._price_digest(old)
+    )
+    old.loc[old.index[0], "FINAL"] = 99.0
+    first, _ = workflow._request_window(
+        record(), old, valid, None, datetime.date(2024, 6, 4)
+    )
+    assert first == record().first_trade_date
+
+
+def test_merged_write_failure_rolls_back_day_and_logs_critical(setup, monkeypatch):
+    run(setup)
+    before = stored(setup).copy()
+    setup[1].values["2024-06-04"] = 103.0
+    real_updates = workflow.updatePrices(setup[0])
+    original_write = real_updates.overwrite_merged_prices_for_contract
+    attempts = []
+
+    def fail_once(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary disk failure")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(real_updates, "overwrite_merged_prices_for_contract", fail_once)
+    monkeypatch.setattr(workflow, "updatePrices", lambda data: real_updates)
+    messages = []
+    monkeypatch.setattr(setup[0].log, "critical", messages.append)
+    with pytest.raises(RuntimeError, match="disk failure"):
+        run(setup, end_date="2024-06-04")
+    pd.testing.assert_frame_equal(pd.DataFrame(stored(setup)), pd.DataFrame(before))
+    assert "fatal error" in messages[0]
+
+
+def test_completed_history_does_not_create_redundant_backups(setup):
+    expired = record(expiry="2024-05-31")
+    run(setup, records=[expired])
+    result = run(setup, records=[expired], end_date="2024-06-10")
+    from pathlib import Path
+
+    assert not list(Path(result.loc["SHFE_CU", "backup"]).glob("*.parquet"))
+
+
+def test_failed_contract_has_explicit_reason_and_no_checkpoint(setup, tmp_path):
+    setup[1].error = TushareTransientError("temporary source failure")
+    result = run(setup)
+    assert result.loc["SHFE_CU", "status"] == "failed"
+    assert "temporary" in result.loc["SHFE_CU", "reason"]
+    assert not (tmp_path / "tushare_updates" / "request_coverage.json").exists()
+
+
+def test_invalid_cutoff_and_zero_prices_are_rejected(setup):
+    with pytest.raises(ValueError, match="start_date"):
+        run(setup, start_date="2024-06-04")
+    with pytest.raises(ValueError, match="非正值"):
+        workflow._validate_prices(
+            prices({"2024-05-29": 0.0}),
+            datetime.date(2024, 5, 1),
+            datetime.date(2024, 6, 1),
+        )
+
+
+def test_history_comparison_and_secret_redaction(monkeypatch):
+    old = prices({"2024-05-28": 100.0, "2024-05-29": 101.0})
+    new = prices({"2024-05-29": 102.0, "2024-05-30": 103.0})
+    changes = workflow._revision_rows(
+        old,
+        new,
+        "SHFE_CU",
+        "20240800",
+        datetime.date(2024, 5, 28),
+        datetime.date(2024, 5, 30),
+    )
+    assert {pd.Timestamp(row["date"]).date() for row in changes} == {
+        datetime.date(2024, 5, 28),
+        datetime.date(2024, 5, 29),
+    }
+    monkeypatch.setenv("TUSHARE_TOKEN", "super-secret-token")
+    assert "super-secret-token" not in workflow.safe_tushare_error_text(
+        "bad super-secret-token"
+    )
+
+
+def test_native_fx_adapter_overlap_and_revision_protection(tmp_path):
+    from sysdata.tushare.source import tushareConnection
+
+    class Client:
+        quotes = {"2024-05-29": 7.2, "2024-05-30": 7.21}
+        calls = []
+
+        def fx_daily(self, ts_code, start_date, end_date):
+            self.calls.append((start_date, end_date))
+            return pd.DataFrame(
+                [
+                    dict(
+                        ts_code=ts_code,
+                        trade_date=day.replace("-", ""),
+                        bid_close=value,
+                        ask_close=value,
+                    )
+                    for day, value in self.quotes.items()
+                    if start_date <= pd.Timestamp(day).date() <= end_date
+                ]
+            )
+
+    client = Client()
+    with dataBlob(
+        parquet_store_path=str(tmp_path / "parquet"),
+        tushare_connection=tushareConnection(client=client),
+    ) as blob:
+        assert (
+            workflow.update_tushare_cnhusd(
+                blob,
+                as_of=datetime.date(2024, 6, 3),
+                full_backfill_start=datetime.date(2024, 1, 1),
+            )
+            == 2
+        )
+        assert isinstance(blob.tushare_fx_prices, workflow.tushareFxPricesData)
+        client.quotes["2024-06-04"] = 7.22
+        assert (
+            workflow.update_tushare_cnhusd(blob, as_of=datetime.date(2024, 6, 4)) == 1
+        )
+        assert client.calls[-1][0] == datetime.date(2024, 5, 23)
+        before = workflow.dataCurrency(blob).get_fx_prices("CNHUSD").copy()
+        client.quotes["2024-05-30"] = 7.5
+        with pytest.raises(RuntimeError, match="changed stored CNHUSD"):
+            workflow.update_tushare_cnhusd(blob, as_of=datetime.date(2024, 6, 4))
+        pd.testing.assert_series_equal(
+            before, pd.Series(workflow.dataCurrency(blob).get_fx_prices("CNHUSD"))
+        )

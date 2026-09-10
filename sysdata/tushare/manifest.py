@@ -1,20 +1,10 @@
-"""Reviewed mapping between Tushare product families and internal instruments.
+"""Reviewed vendor identities and specification eras; trading windows live separately."""
 
-One row per internal instrument.  ``ValidFrom``/``ValidTo`` split a single
-vendor family across a reviewed specification change (DCE fibreboard 2019),
-``Predecessor`` records product-rename chains, and ``StitchMode`` separates
-stitchable outrights from catalogue-only families (monthly-average and TAS
-contracts) that get price data but never a roll policy.
-"""
-
-from __future__ import annotations
-
-import math
-import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from sysdata.tushare.errors import TushareConfigError
@@ -29,17 +19,10 @@ MANIFEST_COLUMNS = (
     "Predecessor",
     "StitchMode",
 )
-
 SUPPORTED_EXCHANGES = ("CFFEX", "DCE", "CZCE", "SHFE", "INE", "GFEX")
-STITCH_MODE = "stitch"
-CATALOG_ONLY_MODE = "catalog_only"
+STITCH_MODE, CATALOG_ONLY_MODE = "stitch", "catalog_only"
 SUPPORTED_STITCH_MODES = (STITCH_MODE, CATALOG_ONLY_MODE)
-
-DEFAULT_MANIFEST_PATH = (
-    Path(__file__).resolve().parent / "config" / "futures_instruments.csv"
-)
-
-_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+DEFAULT_MANIFEST_PATH = Path(__file__).parent / "config" / "futures_instruments.csv"
 
 
 @dataclass(frozen=True)
@@ -54,234 +37,117 @@ class TushareInstrumentMapping:
     stitch_mode: str
 
     @property
-    def is_stitchable(self) -> bool:
+    def is_stitchable(self):
         return self.stitch_mode == STITCH_MODE
 
-    def overlaps(self, first_date: date, last_date: date) -> bool:
-        starts_before_contract_ends = (
-            self.valid_from is None or self.valid_from <= last_date
-        )
-        ends_after_contract_starts = (
-            self.valid_to is None or self.valid_to >= first_date
-        )
-
-        return starts_before_contract_ends and ends_after_contract_starts
+    def overlaps(self, first_date, last_date):
+        return (self.valid_from or date.min) <= last_date and (
+            self.valid_to or date.max
+        ) >= first_date
 
 
 class TushareInstrumentManifest:
-    def __init__(self, mappings: list[TushareInstrumentMapping]):
-        if not mappings:
-            raise TushareConfigError("The Tushare instrument manifest is empty")
-
-        self._mappings = tuple(mappings)
-        self._validate_unambiguous_windows()
-
-    @classmethod
-    def from_csv(
-        cls, filename: str | Path = DEFAULT_MANIFEST_PATH
-    ) -> "TushareInstrumentManifest":
-        manifest_path = Path(filename)
-        try:
-            manifest_frame = pd.read_csv(
-                manifest_path, dtype=str, keep_default_na=False
+    def __init__(self, mappings):
+        self.mappings = tuple(mappings)
+        codes = [mapping.instrument_code for mapping in self.mappings]
+        if not codes or len(codes) != len(set(codes)):
+            raise TushareConfigError("Empty manifest or duplicate internal instruments")
+        for mapping in self.mappings:
+            if mapping.predecessor and mapping.predecessor not in codes:
+                raise TushareConfigError("Unknown predecessor: " + mapping.predecessor)
+        for exchange, code in {(m.exchange, m.fut_code) for m in self.mappings}:
+            ordered = sorted(
+                self.mappings_for_product(exchange, code),
+                key=lambda m: m.valid_from or date.min,
             )
-        except (OSError, pd.errors.ParserError):
-            raise TushareConfigError(
-                "Cannot read Tushare instrument manifest at %s" % manifest_path
-            ) from None
-
-        return cls.from_dataframe(manifest_frame)
-
-    @classmethod
-    def from_dataframe(
-        cls, manifest_frame: pd.DataFrame
-    ) -> "TushareInstrumentManifest":
-        actual_columns = tuple(manifest_frame.columns)
-        if actual_columns != MANIFEST_COLUMNS:
-            raise TushareConfigError(
-                "Tushare manifest columns must be exactly %s"
-                % ", ".join(MANIFEST_COLUMNS)
-            )
-
-        mappings = [
-            _mapping_from_row(row_number=index + 2, row=row)
-            for index, (_, row) in enumerate(manifest_frame.iterrows())
-        ]
-
-        return cls(mappings)
-
-    @property
-    def mappings(self) -> tuple[TushareInstrumentMapping, ...]:
-        return self._mappings
-
-    def configured_instrument_codes(self) -> list[str]:
-        return sorted({mapping.instrument_code for mapping in self._mappings})
-
-    def mappings_for_product(
-        self, exchange: str, fut_code: str
-    ) -> tuple[TushareInstrumentMapping, ...]:
-        return tuple(
-            mapping
-            for mapping in self._mappings
-            if mapping.exchange == exchange and mapping.fut_code == fut_code
-        )
-
-    def mappings_for_contract(
-        self,
-        exchange: str,
-        fut_code: str,
-        first_trade_date: date,
-        expiry_date: date,
-    ) -> tuple[TushareInstrumentMapping, ...]:
-        product_mappings = self.mappings_for_product(exchange, fut_code)
-
-        return tuple(
-            mapping
-            for mapping in product_mappings
-            if mapping.overlaps(first_trade_date, expiry_date)
-        )
-
-    def _validate_unambiguous_windows(self) -> None:
-        seen_instruments: set[str] = set()
-        mappings_by_product: dict[tuple[str, str], list[TushareInstrumentMapping]] = {}
-
-        for mapping in self._mappings:
-            if mapping.instrument_code in seen_instruments:
-                raise TushareConfigError(
-                    "Duplicate internal instrument in Tushare manifest: %s"
-                    % mapping.instrument_code
-                )
-            seen_instruments.add(mapping.instrument_code)
-
-            mappings_by_product.setdefault(
-                (mapping.exchange, mapping.fut_code), []
-            ).append(mapping)
-
-        for product_key, product_mappings in mappings_by_product.items():
-            ordered_mappings = sorted(
-                product_mappings,
-                key=lambda item: item.valid_from or date.min,
-            )
-            previous_end: date | None = None
-            previous_has_open_end = False
-            for position, mapping in enumerate(ordered_mappings):
-                if position > 0 and (
-                    previous_has_open_end
-                    or mapping.valid_from is None
-                    or (previous_end is not None and mapping.valid_from <= previous_end)
-                ):
+            for previous, current in zip(ordered, ordered[1:]):
+                if (previous.valid_to or date.max) >= (current.valid_from or date.min):
                     raise TushareConfigError(
-                        "Overlapping validity windows for Tushare product %s/%s"
-                        % product_key
+                        f"Overlapping validity windows: {exchange}/{code}"
                     )
 
-                previous_end = mapping.valid_to
-                previous_has_open_end = mapping.valid_to is None
+    @classmethod
+    def from_csv(cls, filename=DEFAULT_MANIFEST_PATH):
+        try:
+            frame = pd.read_csv(filename, dtype=str, keep_default_na=False)
+        except (OSError, pd.errors.ParserError) as error:
+            raise TushareConfigError(f"Cannot read manifest: {filename}") from error
+        return cls.from_dataframe(frame)
 
-        unknown_predecessors = sorted(
-            {
-                mapping.predecessor
-                for mapping in self._mappings
-                if mapping.predecessor is not None
-                and mapping.predecessor not in seen_instruments
-            }
-        )
-        if unknown_predecessors:
+    @classmethod
+    def from_dataframe(cls, frame):
+        if tuple(frame.columns) != MANIFEST_COLUMNS:
             raise TushareConfigError(
-                "Unknown predecessor instruments in Tushare manifest: %s"
-                % ", ".join(unknown_predecessors)
+                "Manifest columns must be: " + ", ".join(MANIFEST_COLUMNS)
             )
-
-
-def _mapping_from_row(row_number: int, row: pd.Series) -> TushareInstrumentMapping:
-    instrument_code = _required_text(row, "Instrument", row_number).upper()
-    exchange = _required_text(row, "Exchange", row_number).upper()
-    fut_code = _required_text(row, "FutCode", row_number).upper()
-    predecessor = _optional_text(row, "Predecessor")
-    stitch_mode = _required_text(row, "StitchMode", row_number).lower()
-
-    if exchange not in SUPPORTED_EXCHANGES:
-        raise TushareConfigError(
-            "Unsupported exchange in Tushare manifest row %d" % row_number
+        frame = (
+            frame.fillna("").astype(str).apply(lambda column: column.str.strip()).copy()
         )
-    if not _CODE_PATTERN.fullmatch(instrument_code) or not instrument_code.startswith(
-        exchange + "_"
-    ):
-        raise TushareConfigError(
-            "Instrument must be a valid exchange-qualified code in Tushare "
-            "manifest row %d" % row_number
+        for column in ("Instrument", "Exchange", "FutCode", "Predecessor"):
+            frame[column] = frame[column].str.upper()
+        frame["StitchMode"] = frame.StitchMode.str.lower()
+        valid = frame.Exchange.isin(SUPPORTED_EXCHANGES)
+        for column in ("Instrument", "FutCode"):
+            valid &= frame[column].str.fullmatch(r"[A-Z][A-Z0-9_]*")
+        valid &= pd.Series(
+            [
+                code.startswith(exchange + "_")
+                for code, exchange in zip(frame.Instrument, frame.Exchange)
+            ],
+            index=frame.index,
         )
-    if not _CODE_PATTERN.fullmatch(fut_code):
-        raise TushareConfigError(
-            "Invalid FutCode in Tushare manifest row %d" % row_number
+        valid &= frame.Predecessor.eq("") | frame.Predecessor.str.fullmatch(
+            r"[A-Z][A-Z0-9_]*"
         )
-    if stitch_mode not in SUPPORTED_STITCH_MODES:
-        raise TushareConfigError(
-            "Invalid StitchMode in Tushare manifest row %d" % row_number
-        )
-
-    valid_from = _optional_date(row, "ValidFrom", row_number)
-    valid_to = _optional_date(row, "ValidTo", row_number)
-    if valid_from is not None and valid_to is not None and valid_from > valid_to:
-        raise TushareConfigError(
-            "ValidFrom is after ValidTo in Tushare manifest row %d" % row_number
-        )
-
-    try:
-        min_tick = float(_required_text(row, "MinTick", row_number))
-    except ValueError:
-        min_tick = math.nan
-    if not math.isfinite(min_tick) or min_tick <= 0:
-        raise TushareConfigError(
-            "MinTick must be a positive number in Tushare manifest row %d" % row_number
-        )
-
-    if predecessor is not None:
-        predecessor = predecessor.upper()
-        if not _CODE_PATTERN.fullmatch(predecessor):
+        valid &= frame.StitchMode.isin(SUPPORTED_STITCH_MODES)
+        ticks = pd.to_numeric(frame.MinTick, errors="coerce")
+        valid &= np.isfinite(ticks) & ticks.gt(0)
+        if not valid.all():
             raise TushareConfigError(
-                "Invalid Predecessor in Tushare manifest row %d" % row_number
+                "Invalid manifest rows: " + str(frame.index[~valid].tolist())
             )
-
-    return TushareInstrumentMapping(
-        instrument_code=instrument_code,
-        exchange=exchange,
-        fut_code=fut_code,
-        valid_from=valid_from,
-        valid_to=valid_to,
-        min_tick=min_tick,
-        predecessor=predecessor,
-        stitch_mode=stitch_mode,
-    )
-
-
-def _required_text(row: pd.Series, column: str, row_number: int) -> str:
-    value = _optional_text(row, column)
-    if value is None:
-        raise TushareConfigError(
-            "%s is blank in Tushare manifest row %d" % (column, row_number)
+        for column in ("ValidFrom", "ValidTo"):
+            populated = frame[column].ne("")
+            parsed = pd.to_datetime(
+                frame[column].where(populated), format="%Y%m%d", errors="coerce"
+            )
+            if (
+                populated & (~frame[column].str.fullmatch(r"\d{8}") | parsed.isna())
+            ).any():
+                raise TushareConfigError(f"{column} must use YYYYMMDD")
+            frame[column] = parsed.dt.date.where(parsed.notna(), None)
+        if any(
+            start and end and start > end
+            for start, end in zip(frame.ValidFrom, frame.ValidTo)
+        ):
+            raise TushareConfigError("ValidFrom is after ValidTo")
+        return cls(
+            [
+                TushareInstrumentMapping(
+                    row.Instrument,
+                    row.Exchange,
+                    row.FutCode,
+                    row.ValidFrom,
+                    row.ValidTo,
+                    float(row.MinTick),
+                    row.Predecessor or None,
+                    row.StitchMode,
+                )
+                for row in frame.itertuples(index=False)
+            ]
         )
 
-    return value
+    def configured_instrument_codes(self):
+        return sorted(mapping.instrument_code for mapping in self.mappings)
 
+    def mappings_for_product(self, exchange, fut_code):
+        return tuple(
+            m for m in self.mappings if (m.exchange, m.fut_code) == (exchange, fut_code)
+        )
 
-def _optional_text(row: pd.Series, column: str) -> str | None:
-    value = row[column]
-    if pd.isna(value):
-        return None
-    value_as_string = str(value).strip()
-
-    return value_as_string or None
-
-
-def _optional_date(row: pd.Series, column: str, row_number: int) -> date | None:
-    value = _optional_text(row, column)
-    if value is None:
-        return None
-
-    try:
-        return datetime.strptime(value, "%Y%m%d").date()
-    except ValueError:
-        raise TushareConfigError(
-            "%s must use YYYYMMDD in Tushare manifest row %d" % (column, row_number)
-        ) from None
+    def mappings_for_contract(self, exchange, fut_code, first_trade_date, expiry_date):
+        return tuple(
+            m
+            for m in self.mappings_for_product(exchange, fut_code)
+            if m.overlaps(first_trade_date, expiry_date)
+        )

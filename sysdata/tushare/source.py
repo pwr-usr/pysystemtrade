@@ -1,71 +1,39 @@
-"""Read-only Tushare catalogue and daily price source for Chinese futures."""
-
-from __future__ import annotations
+"""Read-only Tushare data adapters using pysystemtrade contracts and price objects."""
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
-from pathlib import Path
-from typing import Any, Sequence
+from datetime import date
 
 import pandas as pd
 
 from syscore.dateutils import Frequency
-from sysdata.tushare.client import TushareClient
-from sysdata.tushare.errors import (
-    TushareConfigError,
-    TushareDataError,
-)
-from sysdata.tushare.manifest import (
-    DEFAULT_MANIFEST_PATH,
-    SUPPORTED_EXCHANGES,
-    TushareInstrumentManifest,
-    TushareInstrumentMapping,
-)
+from syscore.exceptions import ContractNotFound, missingData
+from sysdata.futures.contracts import futuresContractData
+from sysdata.futures.futures_per_contract_prices import futuresContractPriceData
+from sysdata.fx.spotfx import fxPricesData
+from sysdata.tushare.client import FUT_BASIC_FIELDS, TushareClient, as_date
+from sysdata.tushare.errors import TushareConfigError, TushareDataError
+from sysdata.tushare.manifest import SUPPORTED_EXCHANGES, TushareInstrumentManifest
 from sysdata.tushare.transforms import (
     cnhusd_prices_from_tushare_fx_daily,
     futures_contract_prices_from_tushare_daily,
 )
-from sysobjects.contract_dates_and_expiries import expiryDate
-from sysobjects.contracts import futuresContract
+from syslogging.logger import get_logger
+from sysobjects.contract_dates_and_expiries import expiryDate, listOfContractDateStr
+from sysobjects.contracts import futuresContract, listOfFuturesContracts
 from sysobjects.futures_per_contract_prices import futuresContractPrices
-from sysobjects.spot_fx_prices import fxPrices
 
-EXCHANGE_SUFFIX = {
-    "CFFEX": "CFX",
-    "DCE": "DCE",
-    "CZCE": "ZCE",
-    "SHFE": "SHF",
-    "INE": "INE",
-    "GFEX": "GFE",
-}
-CATALOGUE_REQUIRED_COLUMNS = frozenset(
-    {
-        "ts_code",
-        "symbol",
-        "exchange",
-        "fut_code",
-        "list_date",
-        "delist_date",
-        "d_month",
-    }
+EXCHANGE_SUFFIX = dict(
+    CFFEX="CFX", DCE="DCE", CZCE="ZCE", SHFE="SHF", INE="INE", GFEX="GFE"
 )
+CATALOGUE_REQUIRED_COLUMNS = FUT_BASIC_FIELDS.split(",")
 CNHUSD_SOURCE_CODE = "USDCNH.FXCM"
 CNHUSD_EARLIEST_DATE = date(2012, 2, 18)
-
-_PRODUCT_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
-_CONTRACT_MONTH_PATTERN = re.compile(r"^[0-9]{6}$")
 
 
 @dataclass(frozen=True)
 class HistoricalFuturesContract:
-    """One internal contract record backed by one vendor contract.
-
-    Most vendor contracts map to exactly one record.  A contract spanning a
-    reviewed specification boundary (DCE fibreboard 2019) maps to one record
-    per era, with ``price_start_date``/``price_end_date`` clipping each era's
-    share of the shared vendor history.
-    """
+    """Internal vendor mapping evidence, also retained for saved notebook imports."""
 
     instrument_code: str
     contract_date: str
@@ -77,559 +45,351 @@ class HistoricalFuturesContract:
     price_start_date: date | None = None
     price_end_date: date | None = None
 
-    def as_futures_contract(self) -> futuresContract:
-        """Return the repository contract object with the exact expiry attached."""
-
+    def as_futures_contract(self):
         contract = futuresContract(self.instrument_code, self.contract_date)
-        exact_expiry = expiryDate(
-            self.expiry_date.year, self.expiry_date.month, self.expiry_date.day
+        expiry = self.expiry_date
+        contract.update_single_expiry_date(
+            expiryDate(expiry.year, expiry.month, expiry.day)
         )
-        contract.update_single_expiry_date(exact_expiry)
-
         return contract
 
 
 @dataclass(frozen=True)
 class TushareCatalogueResult:
-    """Mapped records plus any newly discovered, deliberately unconfigured families."""
-
-    contracts: tuple[HistoricalFuturesContract, ...]
-    unmapped_families: tuple[tuple[str, str], ...]
+    _by_contract: dict
+    unmapped_families: tuple
 
     @property
-    def is_complete(self) -> bool:
+    def contracts(self):
+        return tuple(self._by_contract.values())
+
+    @property
+    def is_complete(self):
         return not self.unmapped_families
 
 
-class TushareFuturesPriceSource:
-    """Tushare concrete-contract catalogue and daily price source."""
+class tushareConnection:
+    """One lazy client and one validated catalogue shared by the three data adapters."""
 
-    def __init__(
-        self,
-        client: TushareClient,
-        manifest: TushareInstrumentManifest | str | Path | None = None,
-    ):
+    def __init__(self, client=None, manifest=None):
         self._client = client
         if manifest is None:
-            self._manifest = TushareInstrumentManifest.from_csv(DEFAULT_MANIFEST_PATH)
-        elif isinstance(manifest, TushareInstrumentManifest):
-            self._manifest = manifest
-        else:
-            self._manifest = TushareInstrumentManifest.from_csv(manifest)
-
-    def __repr__(self) -> str:
-        return "Tushare historical futures price source (daily, read-only)"
+            manifest = TushareInstrumentManifest.from_csv()
+        elif not isinstance(manifest, TushareInstrumentManifest):
+            manifest = TushareInstrumentManifest.from_csv(manifest)
+        self.manifest = manifest
+        self._catalogue = None
 
     @property
-    def manifest(self) -> TushareInstrumentManifest:
-        return self._manifest
+    def client(self):
+        if self._client is None:
+            self._client = TushareClient()
+        return self._client
 
     @property
-    def supported_frequencies(self) -> list[Frequency]:
+    def supported_frequencies(self):
         return [Frequency.Day]
 
-    def configured_instrument_codes(self) -> list[str]:
+    def configured_instrument_codes(self):
         return self.manifest.configured_instrument_codes()
 
-    def fetch_contract_catalogue(self) -> list[HistoricalFuturesContract]:
+    def fetch_contract_catalogue(self):
         result = self.fetch_contract_catalogue_result()
         if result.unmapped_families:
             raise TushareConfigError(
-                "Tushare discovered unmapped futures families: %s"
-                % _format_product_families(result.unmapped_families)
+                "Unmapped futures families: " + _families(result.unmapped_families)
             )
-
         return list(result.contracts)
 
-    def fetch_contract_catalogue_result(self) -> TushareCatalogueResult:
-        """
-        Return known mapped records while reporting newly discovered families.
-
-        Schema/identity failures and missing configured families remain fatal.
-        This distinction lets a daily process update known instruments and still
-        finish unsuccessfully when Tushare introduces a new family.
-        """
-
-        catalogue_frames = [
-            self._client.fut_basic(exchange=exchange, fut_type="1")
+    def fetch_contract_catalogue_result(self, refresh=False):
+        if self._catalogue is not None and not refresh:
+            return self._catalogue
+        frames = [
+            _validated_catalogue(
+                self.client.fut_basic(exchange=exchange, fut_type="1"), exchange
+            )
             for exchange in SUPPORTED_EXCHANGES
         ]
-
-        validated_rows: list[dict[str, Any]] = []
-        for exchange, catalogue_frame in zip(SUPPORTED_EXCHANGES, catalogue_frames):
-            validated_rows.extend(
-                _validated_catalogue_rows(catalogue_frame, exchange=exchange)
+        frame = pd.concat(frames, ignore_index=True)
+        if (
+            frame.ts_code.duplicated().any()
+            or frame.duplicated(["exchange", "fut_code", "d_month"]).any()
+        ):
+            raise TushareDataError("Duplicate catalogue identity or delivery month")
+        discovered = set(zip(frame.exchange, frame.fut_code))
+        configured = {(m.exchange, m.fut_code) for m in self.manifest.mappings}
+        if configured - discovered:
+            raise TushareConfigError(
+                "Configured families absent: " + _families(configured - discovered)
             )
-
-        _validate_catalogue_uniqueness(validated_rows)
-        unmapped_families = _unmapped_manifest_products(
-            validated_rows=validated_rows, manifest=self.manifest
-        )
-        _validate_configured_products_are_present(
-            validated_rows=validated_rows, manifest=self.manifest
-        )
-
-        contracts: list[HistoricalFuturesContract] = []
-        covered_mappings: set[TushareInstrumentMapping] = set()
-        uncovered_contracts: list[str] = []
-        for row in validated_rows:
-            if (row["exchange"], row["fut_code"]) in unmapped_families:
+        records, covered = {}, set()
+        for row in frame.itertuples(index=False):
+            if (row.exchange, row.fut_code) not in configured:
                 continue
-
             mappings = self.manifest.mappings_for_contract(
-                exchange=row["exchange"],
-                fut_code=row["fut_code"],
-                first_trade_date=row["list_date"],
-                expiry_date=row["delist_date"],
+                row.exchange,
+                row.fut_code,
+                row.list_date,
+                row.delist_date,
             )
             if not mappings:
-                uncovered_contracts.append(row["ts_code"])
-                continue
-
+                raise TushareConfigError("Validity windows do not cover " + row.ts_code)
             for mapping in mappings:
-                covered_mappings.add(mapping)
-                contracts.append(
-                    _historical_contract_from_catalogue_row(row=row, mapping=mapping)
+                covered.add(mapping.instrument_code)
+                records[
+                    (mapping.instrument_code, row.d_month + "00")
+                ] = HistoricalFuturesContract(
+                    mapping.instrument_code,
+                    row.d_month + "00",
+                    row.ts_code,
+                    row.exchange,
+                    row.fut_code,
+                    row.list_date,
+                    row.delist_date,
+                    max(row.list_date, mapping.valid_from or date.min),
+                    min(row.delist_date, mapping.valid_to or date.max),
                 )
-
-        if uncovered_contracts:
+        uncovered = set(self.configured_instrument_codes()) - covered
+        if uncovered:
             raise TushareConfigError(
-                "Tushare manifest validity windows do not cover contracts: %s"
-                % ", ".join(sorted(uncovered_contracts))
+                "Manifest rows without contracts: " + ", ".join(sorted(uncovered))
             )
-
-        mappings_without_contracts = set(self.manifest.mappings).difference(
-            covered_mappings
+        self._catalogue = TushareCatalogueResult(
+            dict(sorted(records.items())), tuple(sorted(discovered - configured))
         )
-        if mappings_without_contracts:
-            missing_instruments = sorted(
-                mapping.instrument_code for mapping in mappings_without_contracts
-            )
-            raise TushareConfigError(
-                "Tushare manifest rows have no matching contracts: %s"
-                % ", ".join(missing_instruments)
-            )
+        return self._catalogue
 
-        sorted_contracts = sorted(
-            contracts,
-            key=lambda contract: (
-                contract.instrument_code,
-                contract.contract_date,
-                contract.external_contract_code,
-                contract.price_start_date or date.min,
-            ),
-        )
+    def get_record(self, contract):
+        key = (contract.instrument_code, contract.date_str)
+        catalogue = self.fetch_contract_catalogue_result()
+        try:
+            return catalogue._by_contract[key]
+        except KeyError:
+            raise ContractNotFound(
+                f"Unknown Tushare contract: {contract.key}"
+            ) from None
 
-        return TushareCatalogueResult(
-            contracts=tuple(sorted_contracts),
-            unmapped_families=tuple(sorted(unmapped_families)),
+    def get_contracts(self, instrument_code=None) -> listOfFuturesContracts:
+        records = self.fetch_contract_catalogue_result().contracts
+        return listOfFuturesContracts(
+            [
+                record.as_futures_contract()
+                for record in records
+                if instrument_code is None or record.instrument_code == instrument_code
+            ]
         )
 
     def get_prices_at_frequency_for_contract(
-        self,
-        contract: HistoricalFuturesContract,
-        frequency: Frequency = Frequency.Day,
-        start_date: date | str | None = None,
-        end_date: date | str | None = None,
-    ) -> futuresContractPrices:
-        return self.get_prices_for_external_contract(
-            (contract,),
+        self, contract, frequency=Frequency.Day, start_date=None, end_date=None
+    ):
+        """Compatibility for saved reports using vendor catalogue records."""
+        prices = tushareFuturesContractPriceData(self)
+        return prices.get_prices_at_frequency_for_contract_object(
+            contract.as_futures_contract(),
             frequency=frequency,
             start_date=start_date,
             end_date=end_date,
-        )[contract]
-
-    def get_prices_for_external_contract(
-        self,
-        contracts: Sequence[HistoricalFuturesContract],
-        frequency: Frequency = Frequency.Day,
-        start_date: date | str | None = None,
-        end_date: date | str | None = None,
-    ) -> dict[HistoricalFuturesContract, futuresContractPrices]:
-        """
-        Fetch one vendor contract and route it to its internal records.
-
-        One provider request covers the union of the records' effective
-        windows; the validated response is then sliced per record.
-        """
-
-        if frequency != Frequency.Day:
-            raise TushareConfigError(
-                "Tushare futures currently support only Frequency.Day"
-            )
-
-        contracts = tuple(contracts)
-        if not contracts:
-            raise TushareConfigError(
-                "At least one contract is required for a Tushare price request"
-            )
-        if len(set(contracts)) != len(contracts):
-            raise TushareConfigError(
-                "A Tushare external-contract request contains duplicate records"
-            )
-
-        external_codes = {contract.external_contract_code for contract in contracts}
-        if len(external_codes) != 1:
-            raise TushareConfigError(
-                "A Tushare external-contract request must contain one ts_code"
-            )
-        external_code = next(iter(external_codes))
-
-        requested_start = _coerce_optional_date(start_date, "start_date")
-        requested_end = _coerce_optional_date(end_date, "end_date")
-        if (
-            requested_start is not None
-            and requested_end is not None
-            and requested_start > requested_end
-        ):
-            raise TushareConfigError("Tushare price start_date is after end_date")
-
-        effective_windows = {
-            contract: (
-                _latest_date(
-                    contract.first_trade_date,
-                    contract.price_start_date,
-                    requested_start,
-                ),
-                _earliest_date(
-                    contract.expiry_date,
-                    contract.price_end_date,
-                    requested_end,
-                ),
-            )
-            for contract in contracts
-        }
-        populated_windows = [
-            window for window in effective_windows.values() if window[0] <= window[1]
-        ]
-
-        if populated_windows:
-            daily_frame = self._client.fut_daily(
-                ts_code=external_code,
-                start_date=min(window[0] for window in populated_windows),
-                end_date=max(window[1] for window in populated_windows),
-            )
-        else:
-            daily_frame = _empty_fut_daily_frame()
-
-        prices_by_contract = {}
-        for contract, (effective_start, effective_end) in effective_windows.items():
-            frame_for_contract = (
-                daily_frame
-                if effective_start <= effective_end
-                else _empty_fut_daily_frame()
-            )
-            prices_by_contract[contract] = futures_contract_prices_from_tushare_daily(
-                daily_frame=frame_for_contract,
-                expected_ts_code=external_code,
-                price_start_date=effective_start,
-                price_end_date=effective_end,
-            )
-
-        return prices_by_contract
-
-    def get_cnhusd_prices(
-        self,
-        start_date: date | str = CNHUSD_EARLIEST_DATE,
-        end_date: date | str | None = None,
-    ) -> fxPrices:
-        resolved_start = _coerce_required_date(start_date, "start_date")
-        resolved_end = (
-            date.today()
-            if end_date is None
-            else _coerce_required_date(end_date, "end_date")
         )
-        if resolved_start > resolved_end:
-            raise TushareConfigError("Tushare FX start_date is after end_date")
 
-        yearly_frames = []
-        for segment_start, segment_end in _year_segments(resolved_start, resolved_end):
-            yearly_frames.append(
-                self._client.fx_daily(
-                    ts_code=CNHUSD_SOURCE_CODE,
-                    start_date=segment_start,
-                    end_date=segment_end,
+    def get_cnhusd_prices(self, start_date=CNHUSD_EARLIEST_DATE, end_date=None):
+        first, last = as_date(start_date), as_date(end_date) or date.today()
+        if first is None or first > last:
+            raise TushareConfigError("FX start_date is after end_date")
+        frames = []
+        while first <= last:
+            end = min(date(first.year, 12, 31), last)
+            frames.append(
+                self.client.fx_daily(
+                    ts_code=CNHUSD_SOURCE_CODE, start_date=first, end_date=end
                 )
             )
+            first = date(first.year + 1, 1, 1)
+        return cnhusd_prices_from_tushare_fx_daily(frames, CNHUSD_SOURCE_CODE)
 
-        return cnhusd_prices_from_tushare_fx_daily(
-            yearly_frames, expected_ts_code=CNHUSD_SOURCE_CODE
+
+# Compatibility for already-saved reports; all work uses the connection above.
+TushareFuturesPriceSource = tushareConnection
+
+
+class tushareFuturesContractData(futuresContractData):
+    def __init__(self, connection=None, log=get_logger("tushareFuturesContractData")):
+        super().__init__(log=log)
+        self.connection = connection or tushareConnection()
+
+    def get_list_of_all_instruments_with_contracts(self):
+        records = self.connection.fetch_contract_catalogue_result().contracts
+        return sorted({record.instrument_code for record in records})
+
+    def get_all_contract_objects_for_instrument_code(self, instrument_code):
+        return self.connection.get_contracts(instrument_code)
+
+    def get_list_of_contract_dates_for_instrument_code(
+        self, instrument_code, allow_expired=False
+    ):
+        records = self.connection.fetch_contract_catalogue_result().contracts
+        return listOfContractDateStr(
+            [
+                record.contract_date
+                for record in records
+                if record.instrument_code == instrument_code
+                and (allow_expired or record.expiry_date >= date.today())
+            ]
+        )
+
+    def is_contract_in_data(self, instrument_code, contract_date_str):
+        try:
+            self.connection.get_record(
+                futuresContract(instrument_code, contract_date_str)
+            )
+            return True
+        except ContractNotFound:
+            return False
+
+    def _get_contract_data_without_checking(self, instrument_code, contract_date):
+        return self.connection.get_record(
+            futuresContract(instrument_code, contract_date)
+        ).as_futures_contract()
+
+
+class tushareFuturesContractPriceData(futuresContractPriceData):
+    def __init__(
+        self, connection=None, log=get_logger("tushareFuturesContractPriceData")
+    ):
+        super().__init__(log=log)
+        self.connection = connection or tushareConnection()
+
+    def get_contracts_with_merged_price_data(self):
+        return self.connection.get_contracts()
+
+    def get_contracts_with_price_data_for_frequency(self, frequency):
+        return (
+            self.get_contracts_with_merged_price_data()
+            if frequency == Frequency.Day
+            else listOfFuturesContracts([])
+        )
+
+    def get_prices_at_frequency_for_contract_object(
+        self,
+        contract_object,
+        frequency=Frequency.Day,
+        return_empty=True,
+        start_date=None,
+        end_date=None,
+    ):
+        if frequency != Frequency.Day:
+            raise TushareConfigError("Tushare supports Frequency.Day")
+        try:
+            record = self.connection.get_record(contract_object)
+        except ContractNotFound:
+            if return_empty:
+                return futuresContractPrices.create_empty()
+            raise missingData from None
+        first, last = as_date(start_date), as_date(end_date)
+        if first and last and first > last:
+            raise TushareConfigError("Price start_date is after end_date")
+        first = max(
+            first or date.min,
+            record.price_start_date or date.min,
+            record.first_trade_date,
+        )
+        last = min(
+            last or date.max, record.price_end_date or date.max, record.expiry_date
+        )
+        if first > last:
+            return futuresContractPrices.create_empty()
+        frame = self.connection.client.fut_daily(
+            ts_code=record.external_contract_code, start_date=first, end_date=last
+        )
+        return futures_contract_prices_from_tushare_daily(
+            frame, record.external_contract_code, first, last
+        )
+
+    def get_merged_prices_for_contract_object(self, contract_object, return_empty=True):
+        return self.get_prices_at_frequency_for_contract_object(
+            contract_object, return_empty=return_empty
         )
 
 
-def _validated_catalogue_rows(
-    catalogue_frame: pd.DataFrame, exchange: str
-) -> list[dict[str, Any]]:
-    missing_columns = sorted(
-        CATALOGUE_REQUIRED_COLUMNS.difference(catalogue_frame.columns)
-    )
-    if missing_columns:
-        raise TushareDataError(
-            "Tushare fut_basic response for %s is missing fields: %s"
-            % (exchange, ", ".join(missing_columns))
-        )
-    if catalogue_frame.empty:
-        raise TushareDataError(
-            "Tushare fut_basic returned no contracts for %s" % exchange
-        )
+class tushareFxPricesData(fxPricesData):
+    def __init__(self, connection=None, log=get_logger("tushareFxPricesData")):
+        super().__init__(log=log)
+        self.connection = connection or tushareConnection()
 
-    expected_suffix = "." + EXCHANGE_SUFFIX[exchange]
-    validated_rows: list[dict[str, Any]] = []
-    for row_number, (_, row) in enumerate(catalogue_frame.iterrows(), start=1):
-        returned_exchange = _required_catalogue_text(
-            row, "exchange", exchange, row_number
-        ).upper()
-        if returned_exchange != exchange:
-            raise TushareDataError(
-                "Tushare fut_basic returned an unexpected exchange for %s" % exchange
-            )
+    def get_list_of_fxcodes(self):
+        return ["CNHUSD"]
 
-        ts_code = _required_catalogue_text(row, "ts_code", exchange, row_number)
-        if not ts_code.endswith(expected_suffix):
-            raise TushareDataError(
-                "Tushare contract suffix does not match exchange %s" % exchange
+    def get_fx_prices(self, fx_code, start_date=None, end_date=None):
+        if fx_code == "CNHUSD":
+            return self.connection.get_cnhusd_prices(
+                start_date=CNHUSD_EARLIEST_DATE if start_date is None else start_date,
+                end_date=end_date,
             )
+        return super().get_fx_prices(fx_code).loc[start_date:end_date]
 
-        fut_code = _required_catalogue_text(
-            row, "fut_code", exchange, row_number
-        ).upper()
-        if not _PRODUCT_CODE_PATTERN.fullmatch(fut_code):
-            raise TushareDataError(
-                "Tushare fut_basic contains an invalid FutCode for %s" % exchange
-            )
+    def _get_fx_prices_without_checking(self, code):
+        return self.connection.get_cnhusd_prices()
 
-        d_month = _required_catalogue_text(row, "d_month", exchange, row_number)
-        if not _CONTRACT_MONTH_PATTERN.fullmatch(d_month):
-            raise TushareDataError(
-                "Tushare fut_basic d_month must be YYYYMM for %s" % ts_code
-            )
-        month_number = int(d_month[-2:])
-        if month_number < 1 or month_number > 12:
-            raise TushareDataError(
-                "Tushare fut_basic contains an invalid d_month for %s" % ts_code
-            )
 
-        external_code_without_suffix = ts_code[: -len(expected_suffix)]
-        symbol = _required_catalogue_text(row, "symbol", exchange, row_number)
-        if not _is_concrete_external_code(
-            external_code_without_suffix, symbol, fut_code, d_month, exchange
+def _validated_catalogue(frame, exchange):
+    if frame.empty or not set(CATALOGUE_REQUIRED_COLUMNS).issubset(frame):
+        raise TushareDataError(f"Empty or incomplete fut_basic response: {exchange}")
+    frame = frame.loc[:, CATALOGUE_REQUIRED_COLUMNS].copy()
+    for column in CATALOGUE_REQUIRED_COLUMNS:
+        if frame[column].isna().any():
+            raise TushareDataError(f"Missing fut_basic field: {column}")
+        frame[column] = frame[column].astype(str).str.strip()
+    if (frame == "").any().any():
+        raise TushareDataError("Blank fut_basic identity or date")
+    if (
+        not frame.exchange.eq(exchange).all()
+        or not frame.fut_code.str.fullmatch(r"[A-Z][A-Z0-9_]*").all()
+    ):
+        raise TushareDataError("Invalid fut_basic exchange or product")
+    if (
+        not frame.d_month.str.fullmatch(r"\d{6}").all()
+        or not frame.d_month.str[-2:].astype(int).between(1, 12).all()
+    ):
+        raise TushareDataError("fut_basic d_month must be YYYYMM")
+    for column in ("list_date", "delist_date"):
+        parsed = pd.to_datetime(frame[column], format="%Y%m%d", errors="coerce")
+        if parsed.isna().any() or not frame[column].str.fullmatch(r"\d{8}").all():
+            raise TushareDataError(f"fut_basic {column} must use YYYYMMDD")
+        frame[column] = parsed.dt.date
+    if (frame.list_date > frame.delist_date).any():
+        raise TushareDataError("Contract lists after expiry")
+    for row in frame.itertuples(index=False):
+        suffix = "." + EXCHANGE_SUFFIX[exchange]
+        if not row.ts_code.endswith(suffix) or not _is_concrete_external_code(
+            row.ts_code[: -len(suffix)],
+            row.symbol,
+            row.fut_code,
+            row.d_month,
+            exchange,
         ):
-            raise TushareDataError(
-                "Tushare fut_basic returned an inconsistent or synthetic contract: "
-                + ts_code
-            )
-
-        list_date = _parse_catalogue_date(row, "list_date", exchange, row_number)
-        delist_date = _parse_catalogue_date(row, "delist_date", exchange, row_number)
-        if list_date > delist_date:
-            raise TushareDataError(
-                "Tushare contract %s lists after it delists" % ts_code
-            )
-
-        validated_rows.append(
-            dict(
-                ts_code=ts_code,
-                symbol=symbol,
-                exchange=returned_exchange,
-                fut_code=fut_code,
-                list_date=list_date,
-                delist_date=delist_date,
-                d_month=d_month,
-            )
-        )
-
-    return validated_rows
+            raise TushareDataError("Inconsistent or synthetic contract: " + row.ts_code)
+    return frame
 
 
-def _is_concrete_external_code(
-    external_code: str,
-    symbol: str,
-    fut_code: str,
-    d_month: str,
-    exchange: str,
-) -> bool:
-    """Cross-check identity while retaining ``d_month`` as authoritative.
-
-    Handles the CZCE three-digit convention, INE crude TAS contracts, and the
-    DCE ``*_F`` monthly-average families.
-    """
-
+def _is_concrete_external_code(external_code, symbol, fut_code, d_month, exchange):
     if fut_code == "SCTAS":
-        pattern = r"SCTAS([0-9]{3,4})"
+        pattern = r"SCTAS(\d{3,4})"
     elif fut_code.endswith("_F"):
-        product_code = re.escape(fut_code[:-2])
-        pattern = rf"{product_code}([0-9]{{3,4}})F"
+        pattern = re.escape(fut_code[:-2]) + r"(\d{3,4})F"
     else:
-        pattern = rf"{re.escape(fut_code)}([0-9]{{4}})"
-
+        pattern = re.escape(fut_code) + r"(\d{4})"
     match = re.fullmatch(pattern, external_code)
     if match is None:
         return False
-
-    delivery_digits = match.group(1)
-    if fut_code == "SCTAS":
-        expected_symbol = f"SC{delivery_digits}TAS"
-    elif exchange == "CZCE":
-        expected_symbol = f"{fut_code}{d_month[-3:]}"
-    else:
-        expected_symbol = external_code
-    return (
-        symbol == expected_symbol
-        and delivery_digits == d_month[-len(delivery_digits) :]
+    digits = match.group(1)
+    expected_symbol = (
+        "SC" + digits + "TAS"
+        if fut_code == "SCTAS"
+        else fut_code + d_month[-3:]
+        if exchange == "CZCE"
+        else external_code
     )
+    return symbol == expected_symbol and digits == d_month[-len(digits) :]
 
 
-def _validate_catalogue_uniqueness(
-    validated_rows: list[dict[str, Any]],
-) -> None:
-    external_codes: set[str] = set()
-    product_months: set[tuple[str, str, str]] = set()
-    for row in validated_rows:
-        if row["ts_code"] in external_codes:
-            raise TushareDataError(
-                "Tushare fut_basic contains duplicate ts_code values"
-            )
-        external_codes.add(row["ts_code"])
-
-        product_month = (row["exchange"], row["fut_code"], row["d_month"])
-        if product_month in product_months:
-            raise TushareDataError(
-                "Tushare fut_basic contains duplicate product delivery months"
-            )
-        product_months.add(product_month)
-
-
-def _unmapped_manifest_products(
-    validated_rows: list[dict[str, Any]],
-    manifest: TushareInstrumentManifest,
-) -> set[tuple[str, str]]:
-    discovered_products = {(row["exchange"], row["fut_code"]) for row in validated_rows}
-    configured_products = {
-        (mapping.exchange, mapping.fut_code) for mapping in manifest.mappings
-    }
-
-    return discovered_products.difference(configured_products)
-
-
-def _validate_configured_products_are_present(
-    validated_rows: list[dict[str, Any]],
-    manifest: TushareInstrumentManifest,
-) -> None:
-    discovered_products = {(row["exchange"], row["fut_code"]) for row in validated_rows}
-    configured_products = {
-        (mapping.exchange, mapping.fut_code) for mapping in manifest.mappings
-    }
-    missing_products = sorted(configured_products.difference(discovered_products))
-    if missing_products:
-        raise TushareConfigError(
-            "Configured Tushare futures families are absent from fut_basic: %s"
-            % _format_product_families(missing_products)
-        )
-
-
-def _historical_contract_from_catalogue_row(
-    row: dict[str, Any], mapping: TushareInstrumentMapping
-) -> HistoricalFuturesContract:
-    price_start_date = _latest_date(row["list_date"], mapping.valid_from)
-    price_end_date = _earliest_date(row["delist_date"], mapping.valid_to)
-
-    return HistoricalFuturesContract(
-        instrument_code=mapping.instrument_code,
-        contract_date=row["d_month"] + "00",
-        external_contract_code=row["ts_code"],
-        exchange=row["exchange"],
-        product_code=row["fut_code"],
-        first_trade_date=row["list_date"],
-        expiry_date=row["delist_date"],
-        price_start_date=price_start_date,
-        price_end_date=price_end_date,
-    )
-
-
-def _required_catalogue_text(
-    row: pd.Series, column: str, exchange: str, row_number: int
-) -> str:
-    value = row[column]
-    if pd.isna(value) or not str(value).strip():
-        raise TushareDataError(
-            "Tushare fut_basic %s is blank for %s row %d"
-            % (column, exchange, row_number)
-        )
-
-    return str(value).strip()
-
-
-def _parse_catalogue_date(
-    row: pd.Series, column: str, exchange: str, row_number: int
-) -> date:
-    value = _required_catalogue_text(row, column, exchange, row_number)
-    try:
-        return datetime.strptime(value, "%Y%m%d").date()
-    except ValueError:
-        raise TushareDataError(
-            "Tushare fut_basic %s must use YYYYMMDD for %s row %d"
-            % (column, exchange, row_number)
-        ) from None
-
-
-def _coerce_optional_date(value: date | str | None, field_name: str) -> date | None:
-    if value is None:
-        return None
-
-    return _coerce_required_date(value, field_name)
-
-
-def _coerce_required_date(value: date | str, field_name: str) -> date:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-
-    try:
-        return datetime.strptime(str(value).strip(), "%Y%m%d").date()
-    except ValueError:
-        raise TushareConfigError("Tushare %s must use YYYYMMDD" % field_name) from None
-
-
-def _latest_date(*values: date | None) -> date:
-    populated_values = [value for value in values if value is not None]
-    return max(populated_values)
-
-
-def _earliest_date(*values: date | None) -> date:
-    populated_values = [value for value in values if value is not None]
-    return min(populated_values)
-
-
-def _year_segments(start_date: date, end_date: date):
-    segment_start = start_date
-    while segment_start <= end_date:
-        segment_end = min(date(segment_start.year, 12, 31), end_date)
-        yield segment_start, segment_end
-        segment_start = date(segment_start.year + 1, 1, 1)
-
-
-def _empty_fut_daily_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "ts_code",
-            "trade_date",
-            "open",
-            "high",
-            "low",
-            "close",
-            "settle",
-            "vol",
-            "amount",
-            "oi",
-            "oi_chg",
-            "change1",
-            "change2",
-        ]
-    )
-
-
-def _format_product_families(
-    products: tuple[tuple[str, str], ...] | list[tuple[str, str]],
-) -> str:
-    return ", ".join("%s/%s" % product for product in products)
+def _families(values):
+    return ", ".join("/".join(value) for value in sorted(values))

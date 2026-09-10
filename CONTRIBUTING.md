@@ -1,5 +1,15 @@
 # Pysystemtrade contributing guide
 
+## 本副本的发布约定
+
+本副本属于 `pwr-usr/pysystemtrade`。提交和推送使用 `origin`，保留工作分支名称。
+永远不要向原版 upstream（`pst-group/pysystemtrade`、原名
+`robcarver17/pysystemtrade`）创建 PR。`upstream` 用于读取和同步原项目代码。
+如需为本副本创建 PR，必须由用户明确要求，目标仓库固定为 `pwr-usr/pysystemtrade`。
+
+本地已将 Git 的默认推送远程和 GitHub CLI 的默认仓库设为个人仓库。
+后续保留的原项目指南用于了解项目结构和编码风格；发布操作遵循本节约定。
+
 Welcome and thank you for your interest in contributing to the project. This document aims to define policy and describe the preferred workflow
 
 ## Contributing
@@ -233,6 +243,16 @@ Doc tests should be removed from class methods, since they often require a lot o
 Test coverage is extremely sparse. 
 
 ### Documentation
+
+#### Notebooks
+
+Use PyCharm MCP to create, read, edit, and execute notebooks. The `.ipynb`
+files are the source of truth; make changes directly to their cells through
+PyCharm MCP. Keep edits scoped to the task and preserve unrelated cells,
+metadata, and saved outputs. When refreshing results, run the affected cells
+and their dependencies through the notebook kernel and inspect the outputs.
+
+#### Markdown
 
 If you update any of the docs, please make sure the Table of Contents is synced, where applicable. There is a shell script that generates the tables from the Markdown headings. Ideally, each heading should be unique within the document to avoid anchor name clashes.
 

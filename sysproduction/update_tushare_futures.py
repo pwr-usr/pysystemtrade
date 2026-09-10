@@ -1,544 +1,814 @@
-"""Daily update and shared workflow helpers for Tushare Chinese futures.
+"""Download Tushare daily prices and build the native continuous price stores.
 
-Tushare is a read-only historical source.  MongoDB holds mutable contract
-state (exact expiries, sampling flags); Parquet holds canonical price series.
-Tushare provides daily bars only, so the merged (MIXED) series per contract is
-simply a copy of the daily series.
-
-The full-history bootstrap lives in
-``sysinit.futures.seed_price_data_from_tushare`` and reuses the helpers here.
+One entry point handles a new store, daily overlap updates and a dated repair.
+Raw prices stay complete; research eligibility belongs to sim data.
 """
 
-from __future__ import annotations
-
 import datetime
+import hashlib
+import json
 import os
-import sys
-import time
-from collections import defaultdict
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from contextlib import nullcontext, redirect_stdout
+from io import StringIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from syscore.constants import arg_not_supplied
 from syscore.dateutils import DAILY_PRICE_FREQ
+from syscore.fileutils import resolve_path_and_filename_for_package
 from syscore.pandas.merge_data_keeping_past_data import SPIKE_IN_DATA, mergeError
 from sysdata.csv.csv_instrument_data import csvFuturesInstrumentData
+from sysdata.csv.csv_roll_calendars import csvRollCalendarData
+from sysdata.csv.csv_roll_parameters import csvRollParametersData
 from sysdata.csv.csv_spread_costs import csvSpreadCostData
 from sysdata.data_blob import dataBlob
 from sysdata.tools.cleaner import apply_price_cleaning, get_config_for_price_filtering
-from sysdata.tushare.client import (
-    TOKEN_ENVIRONMENT_VARIABLE,
-    TOKEN_PRIVATE_CONFIG_KEY,
-    TushareClient,
-)
-from sysdata.tushare.errors import (
-    TushareTransientError,
-    TushareTruncationError,
-)
+from sysdata.tushare.errors import TushareTransientError, TushareTruncationError
 from sysdata.tushare.source import (
-    CNHUSD_EARLIEST_DATE,
-    CNHUSD_SOURCE_CODE,
-    HistoricalFuturesContract,
-    TushareFuturesPriceSource,
+    tushareFuturesContractData,
+    tushareFuturesContractPriceData,
+    tushareFxPricesData,
 )
-from sysdata.tushare.transforms import (
-    CANONICAL_PRICE_COLUMNS,
-    NOTIONAL_DAILY_CLOSE_HOUR,
-)
-from sysobjects.contracts import futuresContract
+from sysobjects.adjusted_prices import futuresAdjustedPrices
+from sysobjects.contract_dates_and_expiries import contractDate
 from sysobjects.futures_per_contract_prices import futuresContractPrices
+from sysobjects.multiple_prices import futuresMultiplePrices
+from sysobjects.roll_calendars import rollCalendar
+from sysobjects.roll_parameters_with_price_data import (
+    contractWithRollParametersAndPrices,
+)
+from sysobjects.rolls import contractDateWithRollParameters
 from sysproduction.data.contracts import dataContracts
 from sysproduction.data.currency_data import dataCurrency
 from sysproduction.data.prices import diagPrices, updatePrices
+from sysproduction.data.production_data_objects import (
+    FUTURES_CONTRACT_PRICE_DATA,
+    get_class_for_data_type,
+)
 
 DEFAULT_OVERLAP_DAYS = 7
-PROGRESS_EVERY_VENDOR_CONTRACTS = 200
-
-
-class _HistoricalPriceMutationError(RuntimeError):
-    """A provider revision would change already-stored contract history."""
-
-
-class _PriceSpikeError(RuntimeError):
-    """The repository spike guard rejected one contract update."""
-
-
-@dataclass(frozen=True)
-class ContractFailure:
-    instrument_code: str
-    contract_date: str
-    external_code: str
-    reason: str
-
-
-@dataclass
-class TushareRunResult:
-    """Outcome counts; contract counts are for internal contract records."""
-
-    vendor_contracts_seen: int = 0
-    contracts_seen: int = 0
-    contracts_written: int = 0
-    contracts_skipped_complete: int = 0
-    contracts_repaired: int = 0
-    contracts_not_yet_listed: int = 0
-    no_data: list[str] = field(default_factory=list)
-    failures: list[ContractFailure] = field(default_factory=list)
-    rows_written: int = 0
-    fx_rows_added: int = 0
-
-    @property
-    def okay(self) -> bool:
-        return not self.failures
-
-    def add_failure(
-        self, record: HistoricalFuturesContract, error: BaseException | str
-    ) -> None:
-        self.failures.append(
-            ContractFailure(
-                instrument_code=record.instrument_code,
-                contract_date=record.contract_date,
-                external_code=record.external_contract_code,
-                reason=safe_tushare_error_text(error),
-            )
-        )
-
-    def summary(self) -> str:
-        return (
-            f"vendor={self.vendor_contracts_seen} internal={self.contracts_seen} "
-            f"written={self.contracts_written} "
-            f"skipped_complete={self.contracts_skipped_complete} "
-            f"repaired={self.contracts_repaired} "
-            f"not_yet_listed={self.contracts_not_yet_listed} "
-            f"rows={self.rows_written} no_data={len(self.no_data)} "
-            f"failures={len(self.failures)} fx_rows={self.fx_rows_added}"
-        )
-
-
-def validate_tushare_csv_configuration(source: TushareFuturesPriceSource) -> None:
-    """Require one instrument-config and one spread-cost row per instrument."""
-
-    configured_instruments = set(source.configured_instrument_codes())
-
-    instrument_frame = pd.read_csv(csvFuturesInstrumentData().config_file)
-    _require_one_row_per_instrument(
-        instrument_frame, configured_instruments, "instrument configuration"
-    )
-    configured_rows = instrument_frame[
-        instrument_frame["Instrument"].isin(configured_instruments)
-    ]
-    point_sizes = pd.to_numeric(configured_rows["Pointsize"], errors="coerce")
-    if point_sizes.isna().any() or (point_sizes <= 0.0).any():
-        raise RuntimeError("Tushare point sizes must be positive and numeric")
-
-    spread_frame = pd.read_csv(csvSpreadCostData().config_file)
-    _require_one_row_per_instrument(
-        spread_frame, configured_instruments, "spread configuration"
-    )
-    configured_spreads = spread_frame[
-        spread_frame["Instrument"].isin(configured_instruments)
-    ]
-    spread_costs = pd.to_numeric(configured_spreads["SpreadCost"], errors="coerce")
-    if spread_costs.isna().any() or (spread_costs <= 0.0).any():
-        raise RuntimeError("Tushare spread costs must be positive and numeric")
-
-
-def _require_one_row_per_instrument(
-    frame: pd.DataFrame, instruments: set[str], description: str
-) -> None:
-    counts = frame["Instrument"].value_counts()
-    invalid = sorted(
-        instrument for instrument in instruments if int(counts.get(instrument, 0)) != 1
-    )
-    if invalid:
-        raise RuntimeError(
-            f"Tushare {description} must map exactly once: " + ", ".join(invalid)
-        )
-
-
-def _get_tushare_price_cleaning_config(data: dataBlob):
-    """
-    Retain repository cleaning policy except its wall-clock future check.
-
-    Tushare requests are already bounded by ``as_of`` trading date, while daily
-    rows are deliberately timestamped at 23:00.  A run earlier that evening
-    must therefore not discard an already-complete Chinese trading day.
-    """
-
-    return get_config_for_price_filtering(data)._replace(ignore_future_prices=False)
-
-
-def seed_tushare_futures(
-    data: dataBlob,
-    source: TushareFuturesPriceSource,
-    records: Iterable[HistoricalFuturesContract] | None = None,
-    resume: bool = True,
-    as_of: datetime.date | None = None,
-    update_fx: bool = True,
-    report_progress: bool = True,
-) -> TushareRunResult:
-    """Seed all records, using one provider request per external contract code."""
-
-    if records is None:
-        records = source.fetch_contract_catalogue()
-        validate_tushare_csv_configuration(source)
-    record_list = list(records)
-    groups = _group_records_by_external_code(record_list)
-    result = TushareRunResult(
-        vendor_contracts_seen=len(groups), contracts_seen=len(record_list)
-    )
-    as_of = as_of or datetime.date.today()
-
-    contracts = dataContracts(data)
-    prices = diagPrices(data)
-    updates = updatePrices(data)
-    price_store = prices.db_futures_contract_price_data
-    cleaning_config = _get_tushare_price_cleaning_config(data)
-    started_at = time.monotonic()
-
-    for group_number, group in enumerate(groups, start=1):
-        pending: list[tuple[HistoricalFuturesContract, futuresContract]] = []
-        for record in group:
-            try:
-                contract = _upsert_contract_record(contracts, record, as_of)
-                checkpoint = (
-                    _resume_checkpoint(
-                        price_store, updates, contract, record, as_of, result
-                    )
-                    if resume
-                    else None
-                )
-                if checkpoint is not None:
-                    continue
-                if _effective_start(record) > as_of:
-                    result.contracts_not_yet_listed += 1
-                else:
-                    pending.append((record, contract))
-            except Exception as error:
-                _raise_if_fatal_tushare_error(error, data.log)
-                result.add_failure(record, error)
-
-        if pending:
-            pending_records = [record for record, _ in pending]
-            try:
-                downloaded = source.get_prices_for_external_contract(
-                    pending_records,
-                    frequency=DAILY_PRICE_FREQ,
-                    end_date=as_of,
-                )
-            except Exception as error:
-                _raise_if_fatal_tushare_error(error, data.log)
-                for record in pending_records:
-                    result.add_failure(record, error)
-            else:
-                for record, contract in pending:
-                    try:
-                        contract_prices = apply_price_cleaning(
-                            data=data,
-                            broker_prices_raw=downloaded[record],
-                            cleaning_config=cleaning_config,
-                            daily_data=True,
-                        )
-                        if len(contract_prices) == 0:
-                            result.no_data.append(contract.key)
-                            continue
-                        updates.overwrite_prices_at_frequency_for_contract(
-                            contract,
-                            contract_prices,
-                            frequency=DAILY_PRICE_FREQ,
-                        )
-                        updates.overwrite_merged_prices_for_contract(
-                            contract, contract_prices
-                        )
-                        result.contracts_written += 1
-                        result.rows_written += len(contract_prices)
-                    except Exception as error:
-                        _raise_if_fatal_tushare_error(error, data.log)
-                        result.add_failure(record, error)
-
-        if report_progress and (
-            group_number % PROGRESS_EVERY_VENDOR_CONTRACTS == 0
-            or group_number == len(groups)
-        ):
-            _print_seed_progress(group_number, len(groups), result, started_at)
-
-    _update_fx_and_capture_failure(result, data, source, as_of, update_fx)
-    return result
 
 
 def update_tushare_futures(
-    data: dataBlob,
-    source: TushareFuturesPriceSource,
-    records: Iterable[HistoricalFuturesContract] | None = None,
-    overlap_days: int = DEFAULT_OVERLAP_DAYS,
-    as_of: datetime.date | None = None,
-    update_fx: bool = True,
-) -> TushareRunResult:
-    """Refresh contract metadata and append all currently listed contracts."""
+    instrument_code=None,
+    start_date=None,
+    end_date=None,
+    dry_run=False,
+    data=arg_not_supplied,
+    *,
+    update_fx=True,
+    overlap_days=DEFAULT_OVERLAP_DAYS,
+    rebuild=True,
+):
+    """Return one summary row per instrument. Dates accept ISO strings.
 
-    if overlap_days < 0:
-        raise ValueError("overlap_days must be non-negative")
-
-    unmapped_families: tuple[tuple[str, str], ...] = ()
-    if records is None:
-        catalogue = source.fetch_contract_catalogue_result()
-        record_list = list(catalogue.contracts)
-        unmapped_families = catalogue.unmapped_families
+    An explicit start_date repairs that interval, with a recovery copy and
+    field-level revision log. Otherwise historical changes await review.
+    dry_run reads the catalogue, publication probe and stores without importing prices.
+    Inject a dataBlob to select storage and the native Tushare connection.
+    """
+    with (
+        dataBlob(log_name="update_tushare_futures")
+        if data is arg_not_supplied
+        else nullcontext(data)
+    ) as data:
+        if overlap_days < 0:
+            raise ValueError("overlap_days must be non-negative")
+        data.add_class_object(tushareFuturesContractData)
+        data.add_class_object(tushareFuturesContractPriceData)
+        source_contracts = data.tushare_futures_contract
+        source_prices = data.tushare_futures_contract_price
+        source = data.tushare_connection
+        catalogue = source.fetch_contract_catalogue_result(refresh=True)
+        records = list(catalogue.contracts)
         validate_tushare_csv_configuration(source)
-    else:
-        record_list = list(records)
-    as_of = as_of or datetime.date.today()
-    result = TushareRunResult(
-        vendor_contracts_seen=len(
-            {record.external_contract_code for record in record_list}
-        ),
-        contracts_seen=len(record_list),
-    )
-    for exchange, fut_code in unmapped_families:
-        result.failures.append(
-            ContractFailure(
-                instrument_code=f"{exchange}_{fut_code}",
-                contract_date="",
-                external_code="",
-                reason=(
-                    f"Unmapped Tushare family {exchange}/{fut_code}; "
-                    "known families were updated"
-                ),
-            )
+        if not records:
+            raise ValueError("Tushare 合约目录为空")
+        if instrument_code:
+            records = [r for r in records if r.instrument_code == instrument_code]
+            if not records:
+                raise ValueError("Unknown Tushare instrument: " + instrument_code)
+        last = (
+            pd.Timestamp(end_date).date() if end_date else _latest_date(source, records)
         )
-
-    contracts = dataContracts(data)
-    price_store = diagPrices(data).db_futures_contract_price_data
-    updates = updatePrices(data)
-    cleaning_config = _get_tushare_price_cleaning_config(data)
-
-    contracts_by_record: dict[HistoricalFuturesContract, futuresContract] = {}
-    for record in record_list:
-        try:
-            contract = _upsert_contract_record(contracts, record, as_of)
-            if _is_sampling(record, as_of):
-                contracts_by_record[record] = contract
-        except Exception as error:
-            _raise_if_fatal_tushare_error(error, data.log)
-            result.add_failure(record, error)
-
-    active_records = [record for record in record_list if record in contracts_by_record]
-    for record_group in _group_records_by_external_code(active_records):
-        group: list[tuple[HistoricalFuturesContract, futuresContract]] = []
-        starts: dict[HistoricalFuturesContract, datetime.date] = {}
-        old_by_record: dict[HistoricalFuturesContract, futuresContractPrices] = {}
-        for record in record_group:
-            contract = contracts_by_record[record]
-            try:
-                old = price_store.get_prices_at_frequency_for_contract_object(
+        first = pd.Timestamp(start_date).date() if start_date else None
+        if first and first > last:
+            raise ValueError("start_date must not follow end_date")
+        data.add_class_object(get_class_for_data_type(FUTURES_CONTRACT_PRICE_DATA))
+        store = data.db_futures_contract_price
+        if not dry_run:
+            updates, contracts = updatePrices(data), dataContracts(data)
+        root = Path(data.parquet_root_directory).parent / "tushare_updates"
+        state_file = root / "request_coverage.jsonl"
+        state = (
+            dict(json.loads(line) for line in state_file.read_text().splitlines())
+            if state_file.exists()
+            else {}
+        )
+        run = root / pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%S%fZ")
+        cleaning = _get_tushare_price_cleaning_config(data)
+        details, summaries = [], []
+        stitchable = (
+            {m.instrument_code for m in source.manifest.mappings if m.is_stitchable}
+            if hasattr(source, "manifest")
+            else {r.instrument_code for r in records}
+        )
+        for code in sorted({r.instrument_code for r in records}):
+            failed = False
+            for record in [r for r in records if r.instrument_code == code]:
+                contract = source_contracts.get_contract_object(
+                    code, record.contract_date
+                )
+                active_first = record.price_start_date or record.first_trade_date
+                active_last = record.price_end_date or record.expiry_date
+                contract.sampling_on() if active_first <= last <= active_last else contract.sampling_off()
+                old = store.get_prices_at_frequency_for_contract_object(
                     contract, frequency=DAILY_PRICE_FREQ
                 )
-            except Exception as error:
-                _raise_if_fatal_tushare_error(error, data.log)
-                result.add_failure(record, error)
-                continue
-            old_by_record[record] = old
-            overlap_start = (
-                old.index.max().date() - datetime.timedelta(days=overlap_days)
-                if len(old)
-                else _effective_start(record)
-            )
-            starts[record] = max(overlap_start, _effective_start(record))
-            group.append((record, contract))
-
-        if not group:
-            continue
-        group_records = [record for record, _ in group]
-        try:
-            downloaded = source.get_prices_for_external_contract(
-                group_records,
-                frequency=DAILY_PRICE_FREQ,
-                start_date=min(starts.values()),
-                end_date=as_of,
-            )
-        except Exception as error:
-            _raise_if_fatal_tushare_error(error, data.log)
-            for record in group_records:
-                result.add_failure(record, error)
-            continue
-
-        for record, contract in group:
-            try:
-                new = apply_price_cleaning(
-                    data=data,
-                    broker_prices_raw=downloaded[record],
-                    cleaning_config=cleaning_config,
-                    daily_data=True,
+                request_first, request_last = _request_window(
+                    record, old, state.get(contract.key), first, last, overlap_days
                 )
-                corrections = historical_price_correction_dates(
-                    old_by_record[record],
-                    new,
-                    comparison_start=starts[record],
+                row = dict(
+                    instrument=code,
+                    contract=record.contract_date,
+                    start=request_first,
+                    end=request_last,
+                    rows_added=0,
+                    revisions=0,
+                    status="complete",
+                    reason="",
                 )
-                if corrections:
-                    raise _HistoricalPriceMutationError(
-                        "Tushare changed stored history on "
-                        + ",".join(value.isoformat() for value in corrections[:10])
-                        + "; re-seed this contract to accept the new history"
-                    )
-                if len(new) == 0:
-                    result.no_data.append(contract.key)
+                if request_first > request_last:
+                    if not dry_run:
+                        run.mkdir(parents=True, exist_ok=True)
+                        merged = store.get_merged_prices_for_contract_object(contract)
+                        if not pd.DataFrame(old).equals(pd.DataFrame(merged)):
+                            metadata = (
+                                contracts.get_contract_from_db(contract)
+                                if contracts.is_contract_in_data(contract)
+                                else None
+                            )
+                            _save_contract_backup(run, contract, old, store, metadata)
+                            updates.overwrite_merged_prices_for_contract(contract, old)
+                            row["status"] = "repaired_merged"
+                        _upsert_contract_record(contracts, contract, backup=run)
+                    details.append(row)
                     continue
-                rows_added = updates.update_prices_at_frequency_for_contract(
-                    contract_object=contract,
-                    frequency=DAILY_PRICE_FREQ,
-                    new_prices=new,
-                    check_for_spike=True,
-                    max_price_spike=cleaning_config.max_price_spike,
-                )
-                if rows_added is SPIKE_IN_DATA:
-                    raise _PriceSpikeError("price spike check failed")
-                complete_daily = (
-                    price_store.get_prices_at_frequency_for_contract_object(
+                if dry_run:
+                    row["status"] = "planned"
+                    details.append(row)
+                    continue
+                run.mkdir(parents=True, exist_ok=True)
+                try:
+                    fetched = source_prices.get_prices_at_frequency_for_contract_object(
                         contract,
                         frequency=DAILY_PRICE_FREQ,
                         return_empty=False,
+                        start_date=request_first,
+                        end_date=request_last,
+                    )
+                    new = apply_price_cleaning(
+                        data, fetched, cleaning_config=cleaning, daily_data=True
+                    )
+                    _validate_prices(new, request_first, request_last)
+                    if (
+                        not len(new)
+                        and len(old)
+                        and (
+                            (old.index.date >= request_first)
+                            & (old.index.date <= request_last)
+                        ).any()
+                    ):
+                        raise ValueError("供应方返回空数据，已保留请求区间的原始报价")
+                    changes = _revision_rows(
+                        old,
+                        new,
+                        code,
+                        record.contract_date,
+                        request_first,
+                        request_last,
+                    )
+                    row["revisions"] = len(changes)
+                    if changes and first is None:
+                        raise ValueError(
+                            "历史报价发生修订；检查 revisions.csv，再用 start_date 指定修复区间"
+                        )
+                    if first is None:
+                        combined = old.add_rows_to_existing_data(
+                            new,
+                            check_for_spike=True,
+                            max_price_spike=cleaning.max_price_spike,
+                        )
+                        if combined is SPIKE_IN_DATA:
+                            raise ValueError("原生价格跳变检查失败，请检查下载报价")
+                    else:
+                        outside = (
+                            old[
+                                (old.index.date < request_first)
+                                | (old.index.date > request_last)
+                            ]
+                            if len(old)
+                            else old
+                        )
+                        combined = (
+                            futuresContractPrices(
+                                pd.concat([outside, new]).sort_index()
+                            )
+                            if len(outside)
+                            else new
+                        )
+                    previous_metadata = (
+                        contracts.get_contract_from_db(contract)
+                        if contracts.is_contract_in_data(contract)
+                        else None
+                    )
+                    merged = _save_contract_backup(
+                        run, contract, old, store, previous_metadata
+                    )
+                    try:
+                        updates.overwrite_prices_at_frequency_for_contract(
+                            contract, combined, frequency=DAILY_PRICE_FREQ
+                        )
+                        updates.overwrite_merged_prices_for_contract(contract, combined)
+                        _upsert_contract_record(contracts, contract)
+                    except Exception:
+                        updates.overwrite_prices_at_frequency_for_contract(
+                            contract, old, frequency=DAILY_PRICE_FREQ
+                        )
+                        updates.overwrite_merged_prices_for_contract(contract, merged)
+                        if previous_metadata is not None:
+                            contracts.add_contract_data(
+                                previous_metadata, ignore_duplication=True
+                            )
+                        raise
+                    row.update(
+                        rows_added=len(combined.index.difference(old.index)),
+                        status="updated" if len(new) else "no_data",
+                    )
+                    previous = state.get(contract.key, {})
+                    if previous.get("digest") != _price_digest(old):
+                        previous = {}
+                    covered_first = min(
+                        request_first,
+                        pd.Timestamp(previous.get("start", request_first)).date(),
+                    )
+                    # A receipt covers only contiguous requests and the exact stored content.
+                    if previous and request_first > pd.Timestamp(
+                        previous["end"]
+                    ).date() + datetime.timedelta(days=1):
+                        covered_first = request_first
+                    state[contract.key] = dict(
+                        start=str(covered_first),
+                        end=str(request_last),
+                        digest=_price_digest(combined),
+                    )
+                    with state_file.open("a") as receipt_file:
+                        receipt_file.write(
+                            json.dumps([contract.key, state[contract.key]]) + "\n"
+                        )
+                except (
+                    ValueError,
+                    TushareTransientError,
+                    TushareTruncationError,
+                    mergeError,
+                ) as error:
+                    row.update(status="failed", reason=safe_tushare_error_text(error))
+                    failed = True
+                except Exception as error:
+                    data.log.critical(
+                        "Tushare fatal error: " + safe_tushare_error_text(error)
+                    )
+                    raise
+                details.append(row)
+                pd.DataFrame([row]).to_csv(
+                    run / "contracts.csv",
+                    mode="a",
+                    header=not (run / "contracts.csv").exists(),
+                    index=False,
+                )
+                pd.DataFrame(
+                    changes if row["revisions"] else [],
+                    columns=["instrument", "contract", "date", "field", "old", "new"],
+                ).to_csv(
+                    run / "revisions.csv",
+                    mode="a",
+                    header=not (run / "revisions.csv").exists(),
+                    index=False,
+                )
+            selected = pd.DataFrame([r for r in details if r["instrument"] == code])
+            summary = dict(
+                instrument=code,
+                cutoff=last,
+                contracts=len(selected),
+                rows_added=int(selected.rows_added.sum()),
+                revisions=int(selected.revisions.sum()),
+                status="planned" if dry_run else "failed" if failed else "updated",
+                rolls_added=0,
+                reason="; ".join(
+                    selected.loc[selected.status.eq("failed"), "reason"].unique()
+                ),
+                backup="" if dry_run else str(run),
+            )
+            if rebuild and code in stitchable and not dry_run and not failed:
+                try:
+                    summary.update(
+                        rebuild_tushare_prices(
+                            code,
+                            data=data,
+                            end_date=last,
+                            backup=run,
+                            repair_start=first,
+                        )
+                    )
+                except Exception as error:
+                    summary.update(
+                        status="retained_previous",
+                        reason=safe_tushare_error_text(error),
+                    )
+            summaries.append(summary)
+            print(code, summary["status"], "新增行", summary["rows_added"], flush=True)
+        if update_fx and not dry_run and instrument_code is None:
+            run.mkdir(parents=True, exist_ok=True)
+            existing_fx = dataCurrency(data).get_fx_prices("CNHUSD")
+            pd.DataFrame(existing_fx).to_parquet(run / "CNHUSD_before.parquet")
+            try:
+                update_tushare_cnhusd(data=data, as_of=last)
+            except Exception as error:
+                summaries.append(
+                    dict(
+                        instrument="CNHUSD",
+                        status="failed",
+                        reason=safe_tushare_error_text(error),
                     )
                 )
-                updates.overwrite_merged_prices_for_contract(contract, complete_daily)
-                result.rows_written += int(rows_added)
-                result.contracts_written += 1
-            except Exception as error:
-                _raise_if_fatal_tushare_error(error, data.log)
-                result.add_failure(record, error)
+        if instrument_code is None:
+            summaries.extend(
+                dict(
+                    instrument=exchange + "_" + code,
+                    status="failed",
+                    reason="供应方新增品种尚未配置",
+                )
+                for exchange, code in catalogue.unmapped_families
+            )
+        result = pd.DataFrame(summaries).set_index("instrument")
+        if not dry_run:
+            run.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(details).to_csv(run / "contracts.csv", index=False)
+            result.to_csv(run / "summary.csv")
+        return result
 
-    _update_fx_and_capture_failure(result, data, source, as_of, update_fx)
-    data.log.debug("Tushare update: " + result.summary())
-    return result
 
-
-def update_tushare_cnhusd(
-    data: dataBlob,
-    source: TushareFuturesPriceSource,
-    as_of: datetime.date | None = None,
-    full_backfill_start: datetime.date = CNHUSD_EARLIEST_DATE,
-    overlap_days: int = DEFAULT_OVERLAP_DAYS,
-) -> int:
-    """Backfill or overlap-update inverse-midpoint CNHUSD prices."""
-
-    if overlap_days < 0:
-        raise ValueError("overlap_days must be non-negative")
-
-    as_of = as_of or datetime.date.today()
-    currency_data = dataCurrency(data)
-    existing = currency_data.get_fx_prices("CNHUSD")
-    start_date = (
-        max(
-            full_backfill_start,
-            existing.index.max().date() - datetime.timedelta(days=overlap_days),
-        )
-        if len(existing)
-        else full_backfill_start
+def _request_window(record, old, receipt, first, last, overlap_days=7):
+    earliest = record.price_start_date or record.first_trade_date
+    latest = min(record.price_end_date or record.expiry_date, last)
+    if first is not None:
+        return max(first, earliest), latest
+    valid_receipt = (
+        receipt
+        and receipt.get("digest") == _price_digest(old)
+        and pd.Timestamp(receipt["start"]).date() <= earliest
     )
-    new_prices = source.get_cnhusd_prices(start_date=start_date, end_date=as_of)
-    corrections = historical_price_correction_dates(
-        existing,
-        new_prices,
-        comparison_start=start_date,
+    if (
+        valid_receipt
+        and pd.Timestamp(receipt["end"]).date() >= latest
+        and latest < last
+    ):
+        return latest + datetime.timedelta(days=1), latest
+    # Old stored endpoints alone cannot prove coverage of an expired contract.
+    if not valid_receipt:
+        return earliest, latest
+    start = (
+        max(earliest, old.index.max().date() - datetime.timedelta(days=overlap_days))
+        if len(old)
+        else earliest
     )
-    if corrections:
-        raise _HistoricalPriceMutationError(
-            "Tushare changed stored CNHUSD history on "
-            + ",".join(value.isoformat() for value in corrections[:10])
-            + "; run a reviewed full FX replacement to accept the new history"
-        )
-    rows_added = currency_data.update_fx_prices_and_return_rows_added(
-        "CNHUSD", new_prices, check_for_spike=True
+    start = min(
+        start,
+        pd.Timestamp(receipt["end"]).date() - datetime.timedelta(days=overlap_days),
     )
-    if rows_added is SPIKE_IN_DATA:
-        raise _PriceSpikeError("CNHUSD price spike check failed")
-    return int(rows_added)
+    return max(start, earliest), latest
 
 
-def historical_price_correction_dates(
-    old_prices: pd.Series | pd.DataFrame,
-    downloaded_prices: pd.Series | pd.DataFrame,
-    comparison_start: datetime.date | None = None,
-) -> list[datetime.date]:
-    """Dates where the vendor download disagrees with already-stored history."""
-
-    if len(old_prices) == 0:
-        return []
-
-    old_last = old_prices.index.max()
-    historical = (
-        downloaded_prices
-        if len(downloaded_prices) == 0
-        else downloaded_prices[downloaded_prices.index <= old_last]
-    )
-    correction_dates = (
-        []
-        if len(historical) == 0
-        else list(historical.index.difference(old_prices.index).date)
-    )
-    if comparison_start is not None:
-        stored_overlap = old_prices[
-            (old_prices.index.date >= comparison_start) & (old_prices.index <= old_last)
+def _latest_date(source, records):
+    now = pd.Timestamp.now(tz="Asia/Shanghai")
+    bound = now.date() if now.hour >= 18 else (now - pd.Timedelta(days=1)).date()
+    liquid = [
+        r
+        for r in records
+        if r.instrument_code == "SHFE_RB"
+        and r.first_trade_date <= bound <= r.expiry_date
+    ]
+    if not liquid:
+        # A single-instrument update still probes a liquid market for publication.
+        liquid = [
+            r
+            for r in source.fetch_contract_catalogue_result().contracts
+            if r.instrument_code == "SHFE_RB"
+            and r.first_trade_date <= bound <= r.expiry_date
         ]
-        correction_dates.extend(stored_overlap.index.difference(historical.index).date)
-    common_dates = (
-        old_prices.index[:0]
-        if len(historical) == 0
-        else historical.index.intersection(old_prices.index)
+    probe = min(liquid, key=lambda r: abs((r.expiry_date - bound).days - 120))
+    recent = source.client.fut_daily(
+        ts_code=probe.external_contract_code,
+        start_date=(bound - datetime.timedelta(days=14)).strftime("%Y%m%d"),
+        end_date=bound.strftime("%Y%m%d"),
     )
-    if len(common_dates):
-        old_common = pd.DataFrame(old_prices.loc[common_dates]).astype(float)
-        new_common = pd.DataFrame(downloaded_prices.loc[common_dates]).astype(float)
-        equal = np.isclose(
-            old_common.to_numpy(),
-            new_common.to_numpy(),
+    if recent.empty:
+        raise ValueError("近期交易日探针没有报价，请显式指定 end_date")
+    return pd.to_datetime(recent.trade_date).max().date()
+
+
+def rebuild_tushare_prices(
+    instrument_code,
+    data=arg_not_supplied,
+    end_date=None,
+    backup=None,
+    repair_start=None,
+):
+    """Append verified calendar nodes; build both price series before any write."""
+    from sysinit.futures.build_roll_calendars import (
+        _create_approx_calendar_from_earliest_contract,
+        adjust_to_price_series,
+    )
+    from sysinit.futures.multipleprices_from_db_prices_and_csv_calendars_to_db import (
+        process_multiple_prices_single_instrument,
+    )
+
+    with (
+        dataBlob(log_name="rebuild_tushare_prices")
+        if data is arg_not_supplied
+        else nullcontext(data)
+    ) as data:
+        prices = diagPrices(data)
+        cutoff = (
+            pd.Timestamp(end_date or datetime.date.today())
+            + pd.Timedelta(days=1)
+            - pd.Timedelta(nanoseconds=1)
+        )
+        episodes_file = (
+            Path(data.parquet_root_directory).parent / "episode_boundaries.csv"
+        )
+        if not episodes_file.exists():
+            episodes_file = Path(
+                resolve_path_and_filename_for_package(
+                    "data.futures.csvconfig", "instrument_price_episodes.csv"
+                )
+            )
+        episodes_file = Path(
+            data.config.get_element_or_default(
+                "tushare_episode_boundaries_path", episodes_file
+            )
+        )
+        episode_start, episode_calendar = None, None
+        if episodes_file.exists():
+            episodes = (
+                pd.read_csv(episodes_file)
+                .query("Instrument == @instrument_code")
+                .sort_values("Start")
+            )
+            if len(episodes):
+                modes = episodes.get(
+                    "UpdateMode", pd.Series("closed", index=episodes.index)
+                ).fillna("closed")
+                if (
+                    not modes.isin(["closed", "live", "manual"]).all()
+                    or modes.iloc[:-1].eq("live").any()
+                ):
+                    raise ValueError("仅最后一个独立历史段可以标记live")
+                if modes.iloc[-1] != "live":
+                    if (
+                        prices.get_multiple_prices(instrument_code).empty
+                        or prices.get_adjusted_prices(instrument_code).empty
+                    ):
+                        return dict(
+                            status="failed",
+                            rolls_added=0,
+                            reason="缺少已审核独立段的multiple或adjusted价格；请成套导入审核版本",
+                        )
+                    return dict(
+                        status="retained_manual_calendar"
+                        if modes.iloc[-1] == "manual"
+                        else "retained_reviewed_episodes",
+                        rolls_added=0,
+                        reason="已保留审核历史和人工合约链；更新边界或换月前需要复核",
+                    )
+                last_episode = episodes.iloc[-1]
+                if pd.isna(last_episode.get("Calendar")):
+                    raise ValueError("live历史段需要指定已审核Calendar")
+                episode_start = pd.Timestamp(last_episode.Start).normalize()
+                episode_calendar = Path(last_episode.Calendar)
+                if not episode_calendar.is_absolute():
+                    episode_calendar = episodes_file.parent / episode_calendar
+        calendars = csvRollCalendarData(
+            str(episode_calendar.parent)
+            if episode_calendar
+            else data.config.get_element_or_default(
+                "tushare_roll_calendar_path", arg_not_supplied
+            )
+        )
+        calendar_key = episode_calendar.stem if episode_calendar else instrument_code
+        old_calendar = calendars.get_roll_calendar(calendar_key)
+        if old_calendar.empty:
+            raise ValueError("需要先审核并保存该品种换月日历")
+        old_multiple_full = prices.get_multiple_prices(instrument_code)
+        old_adjusted_full = prices.get_adjusted_prices(instrument_code)
+        old_multiple = (
+            old_multiple_full.loc[episode_start:].copy()
+            if episode_start is not None
+            else old_multiple_full.copy()
+        )
+        for name in ["PRICE_CONTRACT", "FORWARD_CONTRACT", "CARRY_CONTRACT"]:
+            old_multiple[name] = (
+                old_multiple[name].astype(str).str.replace(r"\.0$", "", regex=True)
+            )
+        old_adjusted = (
+            old_adjusted_full.loc[episode_start:]
+            if episode_start is not None
+            else old_adjusted_full
+        )
+        if episode_start is not None and (
+            old_multiple.empty or old_multiple.index.min().normalize() != episode_start
+        ):
+            raise ValueError("live历史段Start必须匹配已审核价格起点")
+        raw = prices.db_futures_contract_price_data.get_merged_prices_for_instrument(
+            instrument_code
+        ).final_prices()
+        raw = type(raw)(
+            {
+                key: value.loc[:cutoff]
+                for key, value in raw.items()
+                if len(value.loc[:cutoff])
+            }
+        )
+        parameters = csvRollParametersData(
+            datapath=data.config.get_element_or_default(
+                "tushare_roll_parameters_path", arg_not_supplied
+            )
+        ).get_roll_parameters(instrument_code)
+        candidate = old_calendar.copy()
+        anchor = str(old_calendar.next_contract.iloc[-1])
+        contract = contractWithRollParametersAndPrices(
+            contractDateWithRollParameters(contractDate(anchor), parameters), raw
+        )
+        contract.update_expiry_with_offset_from_parameters()
+        log = StringIO()
+        if (
+            contract.desired_roll_date <= cutoff
+            and anchor < raw.last_contract_date_str()
+        ):
+            with redirect_stdout(log):
+                approximate = _create_approx_calendar_from_earliest_contract(contract)
+                planned = approximate.loc[approximate.index <= cutoff]
+                following = approximate.loc[approximate.index > cutoff].head(1)
+                tail = adjust_to_price_series(
+                    pd.concat([old_calendar.iloc[[-1]], planned, following]), raw
+                )
+            tail = tail.loc[
+                (tail.index > old_calendar.index[-1])
+                & (tail.index <= cutoff)
+                & tail.current_contract.astype(str).isin(
+                    planned.current_contract.astype(str)
+                )
+            ]
+            for actual_date, row in tail.iterrows():
+                expected = planned.index[
+                    planned.current_contract.astype(str).eq(str(row.current_contract))
+                ][0]
+                if abs((actual_date.normalize() - expected.normalize()).days) > 14:
+                    raise ValueError("换月重叠报价距离计划日期超过14天")
+            if len(tail):
+                if str(tail.current_contract.iloc[0]) != anchor:
+                    raise ValueError("换月合约链不连续")
+                candidate = pd.concat([old_calendar, tail])
+        candidate = rollCalendar(candidate)
+        if not np.array_equal(
+            candidate.next_contract.iloc[:-1].astype(str).values,
+            candidate.current_contract.iloc[1:].astype(str).values,
+        ):
+            raise ValueError("换月合约链不连续")
+        with redirect_stdout(log):
+            if not candidate.check_is_valid(raw):
+                raise ValueError("换月日历缺少真实重叠报价")
+            multiple = process_multiple_prices_single_instrument(
+                instrument_code,
+                adjust_calendar_to_prices=False,
+                roll_calendar=candidate,
+                roll_parameters=parameters,
+                ADD_TO_DB=False,
+                ADD_TO_CSV=False,
+                data=data,
+            ).loc[:cutoff]
+        if episode_start is not None:
+            multiple = multiple.loc[episode_start:]
+        if multiple.empty:
+            raise ValueError("原生构建器未生成连续价格")
+        # The native calendar builder starts after its first roll. Preserve the
+        # reviewed initial holding period, which can start before that first roll.
+        prefix = old_multiple.loc[old_multiple.index < multiple.index.min()].copy()
+        if old_multiple.empty:
+            first_roll = candidate.iloc[0]
+            index = raw[str(first_roll.current_contract)].loc[: first_roll.name].index
+            prefix = pd.DataFrame(index=index[index < multiple.index.min()])
+            for name, field in [
+                ("PRICE", "current_contract"),
+                ("FORWARD", "next_contract"),
+                ("CARRY", "carry_contract"),
+            ]:
+                month = str(first_roll[field])
+                prefix[name] = (
+                    raw[month].reindex(prefix.index) if month in raw else np.nan
+                )
+                prefix[name + "_CONTRACT"] = month
+            prefix = prefix.reindex(columns=multiple.columns)
+        if len(prefix) and repair_start is not None:
+            for price_name in ["PRICE", "FORWARD", "CARRY"]:
+                selected = prefix.index >= pd.Timestamp(repair_start)
+                for month in prefix.loc[selected, price_name + "_CONTRACT"].unique():
+                    dates = prefix.index[
+                        selected & prefix[price_name + "_CONTRACT"].eq(month)
+                    ]
+                    prefix.loc[dates, price_name] = (
+                        raw[str(month)].reindex(dates) if str(month) in raw else np.nan
+                    )
+        if len(prefix):
+            multiple = futuresMultiplePrices(pd.concat([prefix, multiple]))
+        for name in ["PRICE_CONTRACT", "FORWARD_CONTRACT", "CARRY_CONTRACT"]:
+            multiple[name] = (
+                multiple[name].astype(str).str.replace(r"\.0$", "", regex=True)
+            )
+        adjusted = futuresAdjustedPrices.stitch_multiple_prices(
+            multiple, forward_fill=False
+        )
+        if (
+            not multiple.index.is_unique
+            or not multiple.index.is_monotonic_increasing
+            or multiple.PRICE.isna().any()
+        ):
+            raise ValueError("连续价格包含重复日期、无序日期或缺失PRICE")
+        pd.testing.assert_frame_equal(
+            pd.DataFrame(candidate.iloc[: len(old_calendar)]),
+            pd.DataFrame(old_calendar),
+            check_dtype=False,
+        )
+        preserved = (
+            old_multiple.index
+            if repair_start is None
+            else old_multiple.index[old_multiple.index < pd.Timestamp(repair_start)]
+        )
+        if len(old_multiple) and old_multiple.index.max() > cutoff:
+            raise ValueError("截止日早于已有连续价格末日，请使用覆盖末日的修复区间")
+        if not preserved.isin(multiple.index).all():
+            raise ValueError("重建会丢失已有历史日期")
+        pd.testing.assert_frame_equal(
+            pd.DataFrame(multiple.reindex(preserved)),
+            pd.DataFrame(old_multiple.reindex(preserved)),
+            check_dtype=False,
+            check_names=False,
+            check_exact=False,
             rtol=1e-10,
-            atol=1e-12,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            adjusted.reindex(preserved).diff(),
+            old_adjusted.reindex(preserved).diff(),
+            atol=1e-7,
             equal_nan=True,
-        ).all(axis=1)
-        correction_dates.extend(common_dates[~equal].date)
-    return sorted(set(correction_dates))
+        )
+        if episode_start is not None:
+            multiple = futuresMultiplePrices(
+                pd.concat(
+                    [
+                        old_multiple_full.loc[old_multiple_full.index < episode_start],
+                        multiple,
+                    ]
+                )
+            )
+            adjusted = futuresAdjustedPrices(
+                pd.concat(
+                    [
+                        old_adjusted_full.loc[old_adjusted_full.index < episode_start],
+                        adjusted,
+                    ]
+                )
+            )
+        backup = (
+            Path(backup)
+            if backup
+            else Path(data.parquet_root_directory).parent
+            / "tushare_updates"
+            / pd.Timestamp.now().strftime("%Y%m%dT%H%M%S%f")
+        )
+        backup.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(old_multiple_full).to_parquet(
+            backup / (instrument_code + "_multiple_before.parquet")
+        )
+        pd.DataFrame(old_adjusted_full).to_parquet(
+            backup / (instrument_code + "_adjusted_before.parquet")
+        )
+        old_calendar.to_csv(backup / (instrument_code + "_calendar_before.csv"))
+        (backup / (instrument_code + "_stitch.txt")).write_text(log.getvalue())
+        try:
+            prices.db_futures_multiple_prices_data.add_multiple_prices(
+                instrument_code,
+                futuresMultiplePrices(multiple),
+                ignore_duplication=True,
+            )
+            prices.db_futures_adjusted_prices_data.add_adjusted_prices(
+                instrument_code,
+                futuresAdjustedPrices(adjusted),
+                ignore_duplication=True,
+            )
+            calendars.add_roll_calendar(
+                calendar_key, candidate, ignore_duplication=True
+            )
+        except Exception:
+            prices.db_futures_multiple_prices_data.add_multiple_prices(
+                instrument_code, old_multiple_full, ignore_duplication=True
+            )
+            prices.db_futures_adjusted_prices_data.add_adjusted_prices(
+                instrument_code, old_adjusted_full, ignore_duplication=True
+            )
+            calendars.add_roll_calendar(
+                calendar_key, old_calendar, ignore_duplication=True
+            )
+            raise
+        return dict(
+            rolls_added=len(candidate) - len(old_calendar),
+            last_price=multiple.index.max(),
+        )
 
 
-def safe_tushare_error_text(error: BaseException | str) -> str:
-    """Format an error while removing any active Tushare credential."""
-
-    text = str(error)
-    for token in _candidate_tokens():
-        text = text.replace(token, "<redacted>")
-    return text
-
-
-def _candidate_tokens() -> set[str]:
-    tokens = set()
-    env_token = os.environ.get(TOKEN_ENVIRONMENT_VARIABLE, "").strip()
-    if env_token:
-        tokens.add(env_token)
-    try:
-        from sysdata.config.private_config import get_private_config_as_dict
-
-        private_token = str(
-            get_private_config_as_dict().get(TOKEN_PRIVATE_CONFIG_KEY) or ""
-        ).strip()
-        if private_token:
-            tokens.add(private_token)
-    except Exception:
-        pass
-    return tokens
+def _save_contract_backup(run, contract, old, store, metadata):
+    prefix = contract.key.replace("/", "_")
+    pd.DataFrame(old).to_parquet(run / (prefix + "_day_before.parquet"))
+    merged = store.get_merged_prices_for_contract_object(contract)
+    pd.DataFrame(merged).to_parquet(run / (prefix + "_merged_before.parquet"))
+    _write_json(
+        run / (prefix + "_metadata_before.json"),
+        None if metadata is None else metadata.as_dict(),
+    )
+    return merged
 
 
-def _upsert_contract_record(
-    contract_data: dataContracts,
-    record: HistoricalFuturesContract,
-    as_of: datetime.date,
-) -> futuresContract:
-    desired = record.as_futures_contract()
-    if _is_sampling(record, as_of):
-        desired.sampling_on()
-    else:
-        desired.sampling_off()
+def _validate_prices(frame, first, last):
+    if not frame.index.is_unique or not frame.index.is_monotonic_increasing:
+        raise ValueError("报价日期重复或无序")
+    if len(frame) and (
+        frame.index.min().date() < first or frame.index.max().date() > last
+    ):
+        raise ValueError("报价超出请求日期")
+    if len(frame) and (not np.isfinite(frame.FINAL).all() or frame.FINAL.le(0).any()):
+        raise ValueError("收盘价非有限值或非正值")
 
+
+def _revision_rows(old, new, code, contract, first, last):
+    if len(old) == 0:
+        return []
+    historical = old[(old.index.date >= first) & (old.index.date <= last)]
+    if historical.empty:
+        return []
+    dates = historical.index.union(new.index[new.index <= old.index.max()])
+    left, right = historical.reindex(dates), new.reindex(
+        index=dates, columns=historical.columns
+    )
+    changed = ~np.isclose(
+        left.to_numpy(), right.to_numpy(), rtol=1e-10, atol=1e-12, equal_nan=True
+    )
+    return [
+        dict(
+            instrument=code,
+            contract=contract,
+            date=str(dates[i]),
+            field=left.columns[j],
+            old=left.iloc[i, j],
+            new=right.iloc[i, j],
+        )
+        for i, j in zip(*np.where(changed))
+    ]
+
+
+def _price_digest(frame):
+    canonical = pd.DataFrame(frame).reindex(columns=sorted(frame.columns)).astype(float)
+    canonical.index = pd.DatetimeIndex(frame.index).astype("datetime64[ns]")
+    return hashlib.sha256(
+        pd.util.hash_pandas_object(canonical, index=True).values.tobytes()
+    ).hexdigest()
+
+
+def _write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, default=str, ensure_ascii=False, indent=2))
+    temporary.replace(path)
+
+
+def _get_tushare_price_cleaning_config(data):
+    return get_config_for_price_filtering(data)._replace(ignore_future_prices=False)
+
+
+def _upsert_contract_record(contract_data, desired, backup=None):
+    existing = None
     if contract_data.is_contract_in_data(desired):
         existing = contract_data.get_contract_from_db(desired)
         if (
@@ -546,200 +816,94 @@ def _upsert_contract_record(
             and existing.currently_sampling == desired.currently_sampling
         ):
             return existing
+    if backup is not None:
+        filename = desired.key.replace("/", "_") + "_metadata_before.json"
+        _write_json(
+            Path(backup) / filename, None if existing is None else existing.as_dict()
+        )
     contract_data.add_contract_data(desired, ignore_duplication=True)
     return desired
 
 
-def _resume_checkpoint(
-    price_store,
-    updates: updatePrices,
-    contract: futuresContract,
-    record: HistoricalFuturesContract,
-    as_of: datetime.date,
-    result: TushareRunResult,
-) -> str | None:
-    """Skip a contract whose stored prices already form a valid checkpoint.
-
-    Returns "skipped_complete", "repaired" (merged series re-derived from the
-    daily series) or None when the contract must be downloaded.
-    """
-
-    # A seed is also a refresh for contracts whose effective trading window is
-    # still open.  Only expired provider records are immutable checkpoints.
-    if as_of <= _effective_end(record):
-        return None
-
-    has_daily = price_store.has_price_data_for_contract_at_frequency(
-        contract, DAILY_PRICE_FREQ
-    )
-    if not has_daily:
-        return None
-    try:
-        daily = price_store.get_prices_at_frequency_for_contract_object(
-            contract, frequency=DAILY_PRICE_FREQ, return_empty=False
+def validate_tushare_csv_configuration(source):
+    instruments = set(source.configured_instrument_codes())
+    for store, column in [
+        (csvFuturesInstrumentData(), "Pointsize"),
+        (csvSpreadCostData(), "SpreadCost"),
+    ]:
+        frame = pd.read_csv(store.config_file)
+        counts = frame.Instrument.value_counts().reindex(
+            list(instruments), fill_value=0
         )
-        _validate_checkpoint(daily, contract, record=record, as_of=as_of)
+        values = pd.to_numeric(
+            frame.loc[frame.Instrument.isin(instruments), column], errors="coerce"
+        )
+        if not counts.eq(1).all() or values.isna().any() or values.le(0).any():
+            raise ValueError("品种配置必须唯一，且 " + column + " 必须为正数")
+
+
+def safe_tushare_error_text(error):
+    from sysdata.config.private_config import get_private_config_as_dict
+
+    text = str(error)
+    try:
+        private_token = get_private_config_as_dict().get("tushare_token")
     except Exception:
-        return None
-
-    if price_store.has_merged_price_data_for_contract(contract):
-        try:
-            mixed = price_store.get_merged_prices_for_contract_object(
-                contract, return_empty=False
-            )
-            _validate_checkpoint(mixed, contract, record=record, as_of=as_of)
-            if pd.DataFrame(daily).equals(pd.DataFrame(mixed)):
-                result.contracts_skipped_complete += 1
-                return "skipped_complete"
-        except Exception:
-            pass
-
-    updates.overwrite_merged_prices_for_contract(contract, daily)
-    result.contracts_repaired += 1
-    result.rows_written += len(daily)
-    return "repaired"
+        private_token = None
+    for token in [os.environ.get("TUSHARE_TOKEN"), private_token]:
+        if token:
+            text = text.replace(str(token), "<redacted>")
+    return text
 
 
-def _validate_checkpoint(
-    prices: futuresContractPrices,
-    contract: futuresContract,
-    *,
-    record: HistoricalFuturesContract,
-    as_of: datetime.date,
-) -> None:
-    if len(prices) == 0:
-        raise RuntimeError(f"Stored checkpoint for {contract.key} is empty")
-    if tuple(prices.columns) != CANONICAL_PRICE_COLUMNS:
-        raise RuntimeError(
-            f"Stored checkpoint for {contract.key} has non-canonical columns"
+def update_tushare_cnhusd(
+    data,
+    as_of=None,
+    full_backfill_start=datetime.date(2010, 8, 23),
+    overlap_days=7,
+):
+    currency = dataCurrency(data)
+    old = currency.get_fx_prices("CNHUSD")
+    first = (
+        max(
+            full_backfill_start,
+            old.index.max().date() - datetime.timedelta(days=overlap_days),
         )
-    if not isinstance(prices.index, pd.DatetimeIndex) or prices.index.tz is not None:
-        raise RuntimeError(
-            f"Stored checkpoint for {contract.key} has a non-canonical index"
-        )
-    if prices.index.has_duplicates or not prices.index.is_monotonic_increasing:
-        raise RuntimeError(
-            f"Stored checkpoint for {contract.key} is unsorted or duplicated"
-        )
-    expected_timestamps = prices.index.normalize() + pd.Timedelta(
-        hours=NOTIONAL_DAILY_CLOSE_HOUR
+        if len(old)
+        else full_backfill_start
     )
-    if not (prices.index == expected_timestamps).all():
-        raise RuntimeError(
-            f"Stored checkpoint for {contract.key} is not normalized to 23:00"
-        )
-
-    first_date = prices.index[0].date()
-    last_date = prices.index[-1].date()
-    latest_allowed_date = min(_effective_end(record), as_of)
-    if first_date < _effective_start(record) or last_date > latest_allowed_date:
-        raise RuntimeError(
-            f"Stored checkpoint for {contract.key} is outside its effective window"
-        )
-
-
-def _effective_start(record: HistoricalFuturesContract) -> datetime.date:
-    return record.price_start_date or record.first_trade_date
-
-
-def _effective_end(record: HistoricalFuturesContract) -> datetime.date:
-    return record.price_end_date or record.expiry_date
-
-
-def _is_sampling(record: HistoricalFuturesContract, as_of: datetime.date) -> bool:
-    return _effective_start(record) <= as_of <= _effective_end(record)
-
-
-def _group_records_by_external_code(
-    records: Sequence[HistoricalFuturesContract],
-) -> list[list[HistoricalFuturesContract]]:
-    groups: dict[str, list[HistoricalFuturesContract]] = defaultdict(list)
-    for record in records:
-        groups[record.external_contract_code].append(record)
-    return list(groups.values())
-
-
-def _print_seed_progress(
-    done: int, total: int, result: TushareRunResult, started_at: float
-) -> None:
-    elapsed_minutes = (time.monotonic() - started_at) / 60.0
-    rate = done / elapsed_minutes if elapsed_minutes > 0 else 0.0
-    print(
-        f"{done}/{total} vendor contracts | "
-        f"written {result.contracts_written} "
-        f"skipped {result.contracts_skipped_complete} "
-        f"repaired {result.contracts_repaired} "
-        f"no_data {len(result.no_data)} "
-        f"failed {len(result.failures)} | "
-        f"{rate:.0f}/min elapsed {elapsed_minutes:.0f}m",
-        flush=True,
+    data.add_class_object(tushareFxPricesData)
+    last = as_of or datetime.date.today()
+    new = data.tushare_fx_prices.get_fx_prices(
+        "CNHUSD", start_date=first, end_date=last
     )
-
-
-def _update_fx_and_capture_failure(
-    result: TushareRunResult,
-    data: dataBlob,
-    source: TushareFuturesPriceSource,
-    as_of: datetime.date,
-    update_fx: bool,
-) -> None:
-    if not update_fx:
-        return
-    try:
-        result.fx_rows_added = update_tushare_cnhusd(data, source, as_of)
-    except Exception as error:
-        _raise_if_fatal_tushare_error(error, data.log)
-        result.failures.append(
-            ContractFailure(
-                instrument_code="CNHUSD",
-                contract_date="",
-                external_code=CNHUSD_SOURCE_CODE,
-                reason=safe_tushare_error_text(error),
-            )
-        )
-
-
-def _raise_if_fatal_tushare_error(error: BaseException, log=None) -> None:
-    """Continue isolated failures, but stop systemic storage/source failures."""
-
-    isolated_errors = (
-        TushareTransientError,
-        TushareTruncationError,
-        _HistoricalPriceMutationError,
-        _PriceSpikeError,
-        mergeError,
+    if _revision_rows(
+        old.to_frame("FX"), new.to_frame("FX"), "CNHUSD", "", first, last
+    ):
+        raise RuntimeError("Tushare changed stored CNHUSD history; review the overlap")
+    added = currency.update_fx_prices_and_return_rows_added(
+        "CNHUSD", new, check_for_spike=True
     )
-    if isinstance(error, isolated_errors):
-        return
-
-    if log is not None:
-        log.critical(
-            "Aborting Tushare workflow after fatal error: "
-            + safe_tushare_error_text(error)
-        )
-    raise error
+    if added is SPIKE_IN_DATA:
+        raise ValueError("CNHUSD price spike check failed")
+    return int(added)
 
 
-if __name__ == "__main__":
+def main(arguments=None):
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--overlap-days", type=int, default=DEFAULT_OVERLAP_DAYS)
+    parser.add_argument("--instrument", dest="instrument_code")
+    parser.add_argument("--start", dest="start_date")
+    parser.add_argument("--end", dest="end_date")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-fx", action="store_true")
-    arguments = parser.parse_args()
+    parsed = vars(parser.parse_args(arguments))
+    parsed["update_fx"] = not parsed.pop("skip_fx")
+    result = update_tushare_futures(**parsed)
+    print(result.to_string())
+    return int(result.status.isin(["failed", "retained_previous"]).any())
 
-    run_data = dataBlob(log_name="update_tushare_futures")
-    run_source = TushareFuturesPriceSource(TushareClient())
-    run_result = update_tushare_futures(
-        data=run_data,
-        source=run_source,
-        overlap_days=arguments.overlap_days,
-        update_fx=not arguments.skip_fx,
-    )
-    print(run_result.summary())
-    for failure in run_result.failures[:20]:
-        print(
-            f"FAILED {failure.instrument_code}/{failure.contract_date} "
-            f"{failure.external_code}: {failure.reason}"
-        )
-    sys.exit(0 if run_result.okay else 1)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

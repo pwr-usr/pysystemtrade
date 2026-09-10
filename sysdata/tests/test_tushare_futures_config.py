@@ -214,7 +214,22 @@ def test_roll_config_and_calendars_stay_in_sync_with_the_manifest(manifest):
             },
             parse_dates=["DATE_TIME"],
         )
-        assert not calendar.empty
+        if calendar.empty:
+            # A closed, single-contract episode has prices and no roll nodes.
+            episode_file = ROLL_CONFIG_PATH.parent / "instrument_price_episodes.csv"
+            episodes = (
+                pd.read_csv(episode_file)
+                .query("Instrument == @instrument_code")
+                .sort_values("Start")
+            )
+            assert not episodes.empty
+            assert episodes.UpdateMode.eq("closed").all()
+            reviewed = episodes.dropna(subset=["Calendar"]).iloc[-1]
+            assert reviewed.PriceRows > 0
+            assert pd.Timestamp(reviewed.Start) <= pd.Timestamp(reviewed.End)
+            episode_calendar = pd.read_csv(episode_file.parent / reviewed.Calendar)
+            assert episode_calendar.empty
+            assert list(episode_calendar.columns) == list(calendar.columns)
         assert calendar["DATE_TIME"].is_monotonic_increasing
         assert calendar["DATE_TIME"].is_unique
         assert (

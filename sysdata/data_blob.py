@@ -22,6 +22,7 @@ class dataBlob(object):
         mongo_db: mongoDb = arg_not_supplied,
         log=arg_not_supplied,
         keep_original_prefix: bool = False,
+        tushare_connection=arg_not_supplied,
     ):
         """
         Set up of a data pipeline with standard attribute names, logging, links to DB etc
@@ -62,6 +63,7 @@ class dataBlob(object):
         self._csv_data_paths = csv_data_paths
         self._keep_original_prefix = keep_original_prefix
         self._parquet_store_path = parquet_store_path
+        self._tushare_connection = tushare_connection
 
         self._attr_list = []
 
@@ -103,6 +105,7 @@ class dataBlob(object):
             arctic=self._add_arctic_class,
             mongo=self._add_mongo_class,
             parquet=self._add_parquet_class,
+            tushare=self._add_tushare_class,
         )
 
         method_to_add_with = class_dict.get(prefix, None)
@@ -120,6 +123,20 @@ class dataBlob(object):
         prefix = split_up_name[0]
 
         return prefix
+
+    def _add_tushare_class(self, class_object):
+        return class_object(
+            connection=self.tushare_connection,
+            log=self._get_specific_logger(class_object),
+        )
+
+    @property
+    def tushare_connection(self):
+        if self._tushare_connection is arg_not_supplied:
+            from sysdata.tushare.source import tushareConnection
+
+            self._tushare_connection = tushareConnection()
+        return self._tushare_connection
 
     def _add_ib_class(self, class_object):
         log = self._get_specific_logger(class_object)
@@ -378,7 +395,9 @@ class dataBlob(object):
         return log_name
 
 
-source_dict = dict(arctic="db", mongo="db", csv="db", parquet="db", ib="broker")
+source_dict = dict(
+    arctic="db", mongo="db", csv="db", parquet="db", ib="broker", tushare="tushare"
+)
 
 
 def identifying_name(
